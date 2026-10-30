@@ -27,6 +27,8 @@ type ServiceInfo struct {
 	PartialReception bool   `json:"partial_reception,omitempty"`
 	NameRawHex       string `json:"name_raw_hex,omitempty"`
 	DecodeLossy      bool   `json:"name_decode_lossy,omitempty"`
+	// Logo はロゴ伝送記述子の内容。ロゴの画像がどこにあるか、ワンセグなら画像の代わりの文字（簡易ロゴ）
+	Logo *LogoTransmission `json:"logo,omitempty"`
 }
 
 type TransportInfo struct {
@@ -917,6 +919,11 @@ func parseServiceDescriptors(data []byte, service *ServiceInfo) {
 			service.Name = strings.TrimSpace(name.Text)
 			service.NameRawHex = hex.EncodeToString(nameRaw)
 			service.DecodeLossy = !name.Lossless()
+		}
+		if data[offset] == DescriptorTagLogoTransmission {
+			if logo, ok := ParseLogoTransmission(data[offset+2 : next]); ok {
+				service.Logo = &logo
+			}
 		}
 		offset = next
 	}
