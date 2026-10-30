@@ -41,6 +41,8 @@ func runTune(arguments []string, stdout, stderr io.Writer) error {
 	output := flags.String("output", "-", "where to write the stream, or - for stdout")
 	withPCSC := flags.Bool("pcsc", false,
 		"also make sure a card socket is being served, for a decoder reading this stream; it stops on its own once nothing is using it")
+	stats := flags.Bool("stats", false,
+		"write the signal and what the daemon sees in the stream to stderr once a second: lock, CNR, bitrate, errors and drops")
 	alias(flags, "o", "output")
 	alias(flags, "t", "tuner")
 	alias(flags, "f", "freq")
@@ -123,6 +125,16 @@ func runTune(arguments []string, stdout, stderr io.Writer) error {
 		<-ctx.Done()
 		_ = stream.Close()
 	}()
+	if *stats {
+		// 統計は別の接続で読むので、ストリームを保持している接続には触れない
+		if chosen == "" {
+			fmt.Fprintln(command.stderr, "no stats: the daemon did not say which tuner it chose")
+		} else {
+			statsCtx, stopStats := context.WithCancel(ctx)
+			defer stopStats()
+			go watchStats(statsCtx, client, chosen, command.stderr)
+		}
+	}
 	if _, err := io.Copy(writer, stream); err != nil && ctx.Err() == nil {
 		return fmt.Errorf("receive the stream: %w", err)
 	}
