@@ -216,6 +216,23 @@ func TestPartialReceptionServicesAreMarked(t *testing.T) {
 	}
 }
 
+// ワンセグのサービスは、ロゴの画像の代わりに短い文字（簡易ロゴ）を持つ
+func TestTheSimpleLogoOfAServiceIsRead(t *testing.T) {
+	text := []byte("NHKG") // ARIB の 8 単位符号として読む。中身は問わない
+	logo := append([]byte{DescriptorTagLogoTransmission, byte(1 + len(text)), LogoText}, text...)
+	service := append([]byte{0x05, 0x80, 0xfc, 0x80, byte(len(logo))}, logo...)
+	sdt := crcSection(0x42, append([]byte{0x7f, 0xe0, 0xc1, 0, 0, 0x7f, 0xe0, 0xff}, service...))
+
+	info := AnalyzePSI([][]byte{sectionPacket(0x11, sdt)})
+	if info == nil || len(info.Services) != 1 {
+		t.Fatalf("info = %#v", info)
+	}
+	got := info.Services[0].Logo
+	if got == nil || got.Type != LogoText || got.Text != DescriptorText(text) {
+		t.Errorf("logo = %#v", got)
+	}
+}
+
 // crcSection wraps a section body in the long-form header and its CRC. The
 // body starts at the table identifier extension, as every table here does.
 func crcSection(tableID byte, body []byte) []byte {
