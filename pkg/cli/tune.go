@@ -43,6 +43,8 @@ func runTune(arguments []string, stdout, stderr io.Writer) error {
 		"also make sure a card socket is being served, for a decoder reading this stream; it stops on its own once nothing is using it")
 	stats := flags.Bool("stats", false,
 		"write the signal and what the daemon sees in the stream to stderr once a second: lock, CNR, bitrate, errors and drops")
+	program := flags.Bool("program", false,
+		"write the programme on now and next to stderr whenever either changes, as the stream's event information table gives them")
 	alias(flags, "o", "output")
 	alias(flags, "t", "tuner")
 	alias(flags, "f", "freq")
@@ -108,6 +110,11 @@ func runTune(arguments []string, stdout, stderr io.Writer) error {
 		return err
 	}
 	defer closeWriter()
+
+	// 番組情報は書き出すストリームから読む。TSMF の分離はこの後ろで包むので、分離したストリームの番組になる
+	if *program {
+		writer = io.MultiWriter(writer, newProgramWatcher(command.stderr))
+	}
 
 	// A satellite demodulator is told the identifier and hands back that stream
 	// alone; a cable multiplex arrives whole and has to be separated here. The
