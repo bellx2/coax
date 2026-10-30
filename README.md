@@ -143,6 +143,8 @@ Pass --tuners to open each board and confirm them.
 止めるときは`Ctrl-C`かSIGTERMを送ります。
 接続が閉じることがチューナーの解放そのものなので、解放の手続きは不要です。
 
+`--stats`を付けると、ロック、CNR、ビットレート、エラーとドロップを1秒ごとに標準エラーへ書きます（`./coax tune --ch 27 --stats | ffplay -`で、見ながら確認できます）。
+
 #### チャンネルリストを作る（`coax scan`と`coax export`）
 
 `scan`で結果をJSONに保存し、`export`で各形式へ変換する2段です。

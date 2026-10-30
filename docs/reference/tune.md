@@ -73,6 +73,31 @@ Linuxでは、PCIeのチューナーだけでなく、Linux DVBのドライバ�
 止めるには、`Ctrl-C`かSIGTERMを送ります。
 接続が閉じるとチューナーは解放されるので、終了処理は不要です。
 
+### 受信状態を見る（`--stats`）
+
+`--stats`を付けると、受信している間、1秒ごとに受信状態を標準エラーへ1行ずつ書きます。
+ストリームは標準出力のままなので、プレーヤーへ渡しながら見られます。
+
+```console
+$ ./coax tune --ch 27 --stats | ffplay -
+12:34:56 locked  CNR 29.6dB  -52dBm  dropped 0  errors 0  discontinuities 0  sync losses 0
+12:34:57 locked  CNR 29.5dB  -52dBm  15.98 Mbps  dropped 0 (+0)  errors 0 (+0)  discontinuities 0 (+0)  sync losses 0 (+0)  scrambled 0%
+```
+
+値は`coaxd`の`GET /tuners/{id}`から読みます（[ストリーム統計](tuner-host.md#ストリーム統計)）。
+カウンタはストリームを開いてからの累計で、括弧内は前の行からの増分です。
+ビットレートと`scrambled`（スタッフィングを除いたパケットのうち、スクランブルされていた割合）は前の行との差から求めるので、2行目から出ます。
+取得できない値は表示しません。
+`errors`と`scrambled`はTSのときだけ表示します。
+
+増分の読み方は次のとおりです。
+
+| 増えるもの | 意味 |
+| --- | --- |
+| `errors` | 電波が弱く、復調器が訂正しきれていない |
+| `discontinuities`が`dropped`と一緒に増える | 読み出しが追いついていない（TLVで`dropped`を伴わないときは電波が弱い）|
+| `sync losses` | 受信できていない |
+
 チャンネル定義ファイルに書ける項目は、どれでも`-P NAME=VALUE`で渡せます（`-P MODULATION=QAM/64`など）。
 書式は[channel-files.md](channel-files.md)と同じです。
 
