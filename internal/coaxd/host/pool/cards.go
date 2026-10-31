@@ -3,7 +3,10 @@
 
 package pool
 
-import "github.com/Till0196/coax/internal/winscard/usbcard"
+import (
+	"github.com/Till0196/coax/internal/coaxd/device"
+	"github.com/Till0196/coax/internal/winscard/usbcard"
+)
 
 // Cards presents the pool as the source of boards the card provider draws on. A
 // PX-W3U4's card slot and its four tuners are one USB device whose interface can
@@ -62,7 +65,7 @@ func (c cardSource) Open(backend, selector string) (usbcard.Borrow, error) {
 			return usbcard.Borrow{}, ErrGone
 		}
 		return usbcard.Borrow{
-			Board: opened,
+			Board: failingCard{Board: opened, reader: hold.Reader(), board: held},
 			Identity: usbcard.Identity{
 				Serial:     one.detected.Serial,
 				Port:       one.detected.Port,
@@ -75,4 +78,30 @@ func (c cardSource) Open(backend, selector string) (usbcard.Borrow, error) {
 		}, nil
 	}
 	return usbcard.Borrow{}, ErrUnknownTuner
+}
+
+// failingCard hands the card's failures to the board, as a tuner's are. A board
+// that dropped off the bus and came back in the same socket keeps its key, so
+// the listing never says it went; a card session holding it would otherwise
+// talk to the dead handle for as long as the daemon runs. Marked gone, the
+// board is reopened on the next borrow.
+type failingCard struct {
+	device.Board
+	reader device.CardReader
+	board  *board
+}
+
+func (c failingCard) CardStatus() (device.CardStatus, error) {
+	status, err := c.reader.CardStatus()
+	return status, c.board.fail(err)
+}
+
+func (c failingCard) ResetCard() ([]byte, error) {
+	atr, err := c.reader.ResetCard()
+	return atr, c.board.fail(err)
+}
+
+func (c failingCard) TransmitAPDU(apdu []byte) ([]byte, error) {
+	response, err := c.reader.TransmitAPDU(apdu)
+	return response, c.board.fail(err)
 }

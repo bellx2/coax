@@ -83,3 +83,39 @@ func TestCardHoldKeepsTheBoardForItself(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 }
+
+// TestCardRecoversFromADeadHandle is a board that dropped off the bus and came
+// back in the same socket while a card session held it. The pool still lists it
+// under the same key, so only the card's own failure can tell the handle is
+// dead; the next connection must get a fresh one rather than the dead one.
+func TestCardRecoversFromADeadHandle(t *testing.T) {
+	pool, registry, board := newTestPool(t, Options{Linger: LingerForever})
+	provider := usbcard.New(usbcard.Config{Boards: pool.Cards()})
+	context, _ := provider.EstablishContext(winscard.ScopeSystem)
+	defer context.Release()
+	readers, _ := context.Readers(nil)
+
+	// A decoder's session keeps the board open across the replug.
+	held, _, err := context.Connect(readers[0], winscard.ShareShared, winscard.ProtocolAny)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer held.Disconnect(winscard.LeaveCard)
+
+	board.killHandles()
+	if _, err := held.Status(); err == nil {
+		t.Fatal("the card answered on a dead handle")
+	}
+
+	card, _, err := context.Connect(readers[0], winscard.ShareShared, winscard.ProtocolAny)
+	if err != nil {
+		t.Fatalf("connect after the handle died: %v", err)
+	}
+	defer card.Disconnect(winscard.LeaveCard)
+	if _, _, err := card.Transmit([]byte{0x90, 0x30, 0x00, 0x00, 0x00}, winscard.ProtocolT1); err != nil {
+		t.Errorf("send an APDU on the fresh handle: %v", err)
+	}
+	if got := registry.openCount(); got != 2 {
+		t.Errorf("opened the board %d times, want 2: the dead handle should be replaced", got)
+	}
+}

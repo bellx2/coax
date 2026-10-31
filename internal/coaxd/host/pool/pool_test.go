@@ -46,7 +46,7 @@ func (r *fakeRegistry) Open(one Detected, options device.Options) (device.Board,
 	}
 	board.opened.Add(1)
 	if board.card {
-		return cardBoard{fakeBoard: board}, nil
+		return cardBoard{fakeBoard: board, open: board.opened.Get()}, nil
 	}
 	return board, nil
 }
@@ -67,6 +67,9 @@ type fakeBoard struct {
 	closed  counter
 	taken   map[int]bool
 	tuneErr error
+	// deadOpens makes the card on every handle opened so far answer ErrGone, as
+	// a handle does once its device has dropped off the bus and come back.
+	deadOpens int
 	// streams makes the tuners hand out a stream, and events records what was
 	// closed in what order.
 	streams bool
@@ -175,10 +178,26 @@ func (s *fakeStream) Close() error {
 }
 
 // cardBoard also carries a card reader, as a real board does through a wrapper
-// around the same handle.
-type cardBoard struct{ *fakeBoard }
+// around the same handle. open counts which opening of the board this handle is.
+type cardBoard struct {
+	*fakeBoard
+	open int
+}
+
+// killHandles makes every handle opened so far dead to the card.
+func (b *fakeBoard) killHandles() {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	b.deadOpens = b.opened.Get()
+}
 
 func (b cardBoard) CardStatus() (device.CardStatus, error) {
+	b.mutex.Lock()
+	dead := b.open <= b.deadOpens
+	b.mutex.Unlock()
+	if dead {
+		return device.CardStatus{}, usbio.ErrGone
+	}
 	return device.CardStatus{Present: true, Reader: "fake"}, nil
 }
 func (b cardBoard) ResetCard() ([]byte, error)          { return []byte{0x3b}, nil }
