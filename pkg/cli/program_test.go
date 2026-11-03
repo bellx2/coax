@@ -16,12 +16,23 @@ import (
 
 // eventSection は 1 番組だけを載せた、今と次の番組の表（EIT）のセクション
 func eventSection(service uint16, number byte, eventID uint16, start time.Time, duration time.Duration, title []byte) []byte {
+	return detailedEventSection(service, number, eventID, start, duration, title, nil, nil)
+}
+
+// detailedEventSection は説明の文（text）と、拡張形式イベント記述子の中身（extended、1 つが 1 記述子）も載せる
+func detailedEventSection(service uint16, number byte, eventID uint16, start time.Time, duration time.Duration,
+	title, text []byte, extended [][]byte) []byte {
 	epoch := time.Date(1858, time.November, 17, 0, 0, 0, 0, time.UTC)
 	day := uint16(start.Sub(epoch).Hours() / 24)
 	bcd := func(value int) byte { return byte(value/10<<4 | value%10) }
 	short := append([]byte{'j', 'p', 'n', byte(len(title))}, title...)
-	short = append(short, 0)
+	short = append(short, byte(len(text)))
+	short = append(short, text...)
 	descriptors := append([]byte{isdb.DescriptorTagShortEvent, byte(len(short))}, short...)
+	for _, body := range extended {
+		descriptors = append(descriptors, isdb.DescriptorTagExtendedEvent, byte(len(body)))
+		descriptors = append(descriptors, body...)
+	}
 
 	event := binary.BigEndian.AppendUint16(nil, eventID)
 	event = binary.BigEndian.AppendUint16(event, day)
@@ -95,5 +106,49 @@ func TestProgramWatcherReportsNowAndNext(t *testing.T) {
 	watcher.Write(append(packets(eventSection(1408, 0, 1, day.Add(21*time.Hour), time.Hour, news)), nullPacket()...))
 	if out.Len() != 0 {
 		t.Errorf("wrote %q for a table that had not changed", out.String())
+	}
+}
+
+// extendedBody は拡張形式イベント記述子の中身。items は見出しと値を交互に並べる
+func extendedBody(number, last byte, items ...[]byte) []byte {
+	var list []byte
+	for _, item := range items {
+		list = append(list, byte(len(item)))
+		list = append(list, item...)
+	}
+	body := []byte{number<<4 | last, 'j', 'p', 'n', byte(len(list))}
+	body = append(body, list...)
+	return append(body, 0) // text_length
+}
+
+func TestProgramWatcherReportsDetails(t *testing.T) {
+	day := time.Date(2026, 10, 30, 0, 0, 0, 0, time.UTC)
+	// 8 単位符号の 0x0D（APR）は改行になる。値は 2 つの記述子にまたがり、見出しの無い 2 つ目が続き
+	title, text := []byte("NEWS"), []byte("AB\rCD")
+	cast, castValue, rest := []byte("EF"), []byte("GH"), []byte("IJ")
+	section := detailedEventSection(1408, 0, 1, day.Add(21*time.Hour), time.Hour, title, text, [][]byte{
+		extendedBody(0, 1, cast, castValue),
+		extendedBody(1, 1, nil, rest),
+	})
+	var out bytes.Buffer
+	watcher := newProgramWatcher(&out)
+	watcher.Write(append(packets(section), nullPacket()...))
+
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	want := []string{
+		"now 21:00-22:00 " + isdb.DescriptorText(title),
+		"now-text " + strings.ReplaceAll(isdb.DescriptorText(text), "\r", `\n`),
+		"now-item " + isdb.DescriptorText(cast) + "\t" + isdb.DescriptorText(append(append([]byte{}, castValue...), rest...)),
+	}
+	if len(lines) != len(want) {
+		t.Fatalf("got %q, want %d lines", lines, len(want))
+	}
+	for i := range want {
+		if !strings.HasSuffix(lines[i], want[i]) {
+			t.Errorf("line %d = %q, want suffix %q", i, lines[i], want[i])
+		}
+	}
+	if !strings.Contains(lines[1], `\n`) {
+		t.Errorf("text line %q should carry the line break as \\n", lines[1])
 	}
 }

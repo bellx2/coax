@@ -6,6 +6,8 @@ package cli
 import (
 	"fmt"
 	"io"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/Till0196/coax/pkg/isdb"
@@ -33,6 +35,15 @@ type programEvent struct {
 	// 開始と長さは不明のことがある
 	startKnown, durationKnown bool
 	title                     string
+	// 番組の説明（短形式イベント記述子の文）と、詳しい説明（拡張形式イベント記述子の項目）
+	text  string
+	items []isdb.ExtendedEventItem
+}
+
+func (event programEvent) equal(other programEvent) bool {
+	return event.id == other.id && event.start == other.start && event.duration == other.duration &&
+		event.startKnown == other.startKnown && event.durationKnown == other.durationKnown &&
+		event.title == other.title && event.text == other.text && slices.Equal(event.items, other.items)
 }
 
 func newProgramWatcher(w io.Writer) *programWatcher {
@@ -110,10 +121,20 @@ func eventOf(event isdb.Event) programEvent {
 		startKnown:    event.StartKnown,
 		durationKnown: event.DurationKnown,
 	}
-	if descriptor, ok := isdb.FindDescriptor(event.Descriptors, isdb.DescriptorTagShortEvent); ok {
-		if short, ok := isdb.ParseShortEvent(descriptor.Body); ok {
-			one.title = short.Title
+	var extended [][]byte
+	for _, descriptor := range event.Descriptors {
+		switch descriptor.Tag {
+		case isdb.DescriptorTagShortEvent:
+			if short, ok := isdb.ParseShortEvent(descriptor.Body); ok {
+				one.title, one.text = short.Title, short.Text
+			}
+		case isdb.DescriptorTagExtendedEvent:
+			extended = append(extended, descriptor.Body)
 		}
+	}
+	// 項目は複数の記述子にまたがることがあるので、まとめてから読む
+	if len(extended) > 0 {
+		one.items = isdb.JoinExtendedEvents(extended)
 	}
 	return one
 }
@@ -134,12 +155,27 @@ func (watcher *programWatcher) report() {
 	now := time.Now().Format("15:04:05")
 	for index, label := range []string{"now", "next"} {
 		event := chosen[index]
-		if event == watcher.shown[index] || event.title == "" {
+		if event.equal(watcher.shown[index]) || event.title == "" {
 			continue
 		}
 		watcher.shown[index] = event
+		// 番組の行のあとに、説明を「-text」、詳しい説明の項目を「-item」の行で続ける。どちらも無ければ書かない
 		fmt.Fprintf(watcher.w, "%s %s %s %s\n", now, label, event.span(), event.title)
+		if event.text != "" {
+			fmt.Fprintf(watcher.w, "%s %s-text %s\n", now, label, oneLine(event.text))
+		}
+		for _, item := range event.items {
+			fmt.Fprintf(watcher.w, "%s %s-item %s\t%s\n", now, label, oneLine(item.Heading), oneLine(item.Value))
+		}
 	}
+}
+
+// 1 行に収まるよう、改行とタブを「\n」「\t」と書き、「\」は「\\」と書く。
+// 8 単位符号の改行（APR）は CR になるので、CR も改行として扱う
+var lineEscaper = strings.NewReplacer("\\", "\\\\", "\r\n", "\\n", "\r", "\\n", "\n", "\\n", "\t", "\\t")
+
+func oneLine(text string) string {
+	return lineEscaper.Replace(text)
 }
 
 // span は放送の時刻（日本時間）での「開始-終了」。分からないところは空にする
