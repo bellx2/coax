@@ -182,6 +182,8 @@ type tuner struct {
 	resetLine func(onoff int)
 	sleepLine func(onoff int)
 	sleep     func(time.Duration)
+	// now is the clock the temperature's age is read from.
+	now func() time.Time
 
 	currentBand uint8
 	tuneState   int
@@ -235,6 +237,8 @@ type tuner struct {
 	rest        uint32
 	bias        uint16
 	temperature int16
+	// temperatureAt is when temperature was measured; zero before the first.
+	temperatureAt time.Time
 
 	wbdCalibrationGain uint8
 	currentWBDTable    []wbdSlope
@@ -1268,6 +1272,10 @@ func (state *tuner) captrimSearch() int {
 	return ret
 }
 
+// temperatureMaxAge is how long a temperature reading is used before the
+// tuner measures it again.
+const temperatureMaxAge = time.Minute
+
 // getTemperature is dib0090_get_temperature.
 func (state *tuner) getTemperature() int {
 	ret := 15
@@ -1291,6 +1299,7 @@ func (state *tuner) getTemperature() int {
 	case tunerStep1:
 		val := int16(state.getSlowADCVal())
 		state.temperature = int16(int(int16((int(val)-int(state.adcDiff))*180))>>8) + 55
+		state.temperatureAt = state.now()
 
 		state.tuneState = tunerStep2
 
@@ -1326,6 +1335,15 @@ func (state *tuner) tune() uint32 {
 	var lo5, lo6, den, tmp uint16
 	var fbDiv, rest, fRef, vcofKHz uint32
 	ret := uint32(10) // 1ms is the default delay most of the time
+
+	// Linux measures the temperature at every tune, which costs four steps
+	// of at least 10ms each. It only adjusts the wideband detector's target,
+	// and a tuner's temperature does not move within a minute, so a recent
+	// reading is kept.
+	if state.calibrate&tempCal != 0 && state.tuneState == tunerStart && !state.temperatureAt.IsZero() &&
+		state.now().Sub(state.temperatureAt) < temperatureMaxAge {
+		state.calibrate &^= tempCal
+	}
 
 	// in any case we first need to do a calibration if needed
 	if state.tuneState == tunerStart {
