@@ -976,17 +976,16 @@ func (state *dib8000) tune() int {
 
 	case demodStep10: // 40
 		locks = state.readLock()
-		if locks&(1<<(7-state.longestIntlvLayer)) != 0 { // mpeg lock : check the longest one
+		// Linux waits for the MPEG lock of the layer with the longest
+		// interleaver and takes any other layer only at the timeout. On
+		// terrestrial that layer is the one-segment layer A, whose deep
+		// interleaver locks some 300ms after layer B, which carries the
+		// full-segment service; data flows as soon as any layer locks.
+		if locks&(0x7<<5) != 0 {
 			state.status = statusDataLocked
 			state.tuneState = demodStop
 		} else if now.After(state.timeout) {
-			// The longest interleaver's layer did not lock; see whether
-			// another one did in the meantime.
-			if locks&(0x7<<5) != 0 {
-				state.status = statusDataLocked
-			} else {
-				state.status = statusTuneFailed
-			}
+			state.status = statusTuneFailed
 			state.tuneState = demodStop
 		}
 	}

@@ -290,6 +290,7 @@ func New(bus i2c.Bus) *Demod {
 		config:  dib809xDiB0090Config(),
 		channel: &board.channel,
 		sleep:   pause,
+		now:     time.Now,
 	}
 
 	// dib80xx_tuner_reset and dib80xx_tuner_sleep: the tuner's reset and
@@ -332,6 +333,7 @@ func (board *Demod) setTiming(now func() time.Time, sleep func(time.Duration), t
 	board.demod.sleep = sleep
 	board.demod.tuneTimeout = tuneTimeout
 	board.tuner.sleep = sleep
+	board.tuner.now = now
 }
 
 // Initialize identifies the chip, resets the demodulator, registers and
