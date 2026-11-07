@@ -157,6 +157,8 @@ Pass --tuners to open each board and confirm them.
 ./coax export --input scan.json --output channels.yml      # Mirakurun形式へ変換
 ```
 
+coaxが対応していないチューナーも、選局してTSを標準出力へ書き続けるコマンドがあれば、`--tune-command`でスキャンできます（[scan.md](docs/scanner/scan.md#外部コマンドで選局する--tune-command)）。
+
 進捗は標準エラーへ出ます。
 端末では最後の1行がその場で書き換わり、ファイルやパイプへリダイレクトすると候補ごとに1行ずつ出ます。
 受信できたストリームは、サービスまで分かった時点で表示されます。
