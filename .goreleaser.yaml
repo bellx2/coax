@@ -195,7 +195,7 @@ nfpms:
 
 dockers_v2:
   - images:
-      - ghcr.io/till0196/coax
+      - ghcr.io/bellx2/coax
     tags:
       - "{{ .Version }}"
       - latest
@@ -209,7 +209,7 @@ dockers_v2:
       - linux/386
       - linux/arm/v7
     labels:
-      org.opencontainers.image.source: https://github.com/Till0196/coax
+      org.opencontainers.image.source: https://github.com/bellx2/coax
       org.opencontainers.image.version: "{{ .Version }}"
       org.opencontainers.image.revision: "{{ .FullCommit }}"
       org.opencontainers.image.licenses: Apache-2.0 OR GPL-2.0-or-later
