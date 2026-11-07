@@ -23,7 +23,7 @@ func Run(arguments []string, stdin io.Reader, stdout io.Writer, stderr io.Writer
 	case "scan":
 		return runScan(arguments[1:], stdout, stderr)
 	case "tune":
-		return runTune(arguments[1:], stdout, stderr)
+		return runTune(arguments[1:], stdin, stdout, stderr)
 	case "export":
 		return runExport(arguments[1:], stdin, stdout, stderr)
 	case "card":

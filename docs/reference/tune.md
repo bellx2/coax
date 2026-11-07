@@ -128,6 +128,22 @@ $ ./coax tune --ch 27 --program -o /dev/null
 - `--stream-id`でTSMFから分離するときは、分離したストリームの番組を出します
 - `--stats`と一緒に使えます。行の2番目の語（`now`、`next`か、`locked`などの受信状態）で区別できます
 
+### 受信済みのストリームを読む（`--input`）
+
+`--input`を付けると、選局せず、ファイルか標準入力（`-`）から受信済みのストリームを読んで書き出します。
+coaxが対応していないチューナーの出力に、`--program`と`--stats`を使うためのものです。
+`coaxd`には接続しません。
+
+```console
+$ pix-ts --runtime-dir "$runtime_dir" --instance tuner --receiver 0 -c T27 -t - -o - | ./coax tune --input - --program --stats | ffplay -
+```
+
+- 入力をそのまま書き出します。`--output`（`-o`）で書き出す先を指定できます
+- `--stats`は、`coaxd`から読む代わりに入力を数えます。ロック、CNR、入力レベル、`dropped`は分からないので表示しません
+- 入力が届くまでは、`--stats`の行を書きません
+- 入力が終わると終了します。`Ctrl-C`かSIGTERMでも終了します
+- 一緒に使えるのは`--output`、`--stats`、`--program`、`--verbose`だけです。選局やデーモンのためのオプション（`--ch`、`--tuner`など）を付けるとエラーになります
+
 チャンネル定義ファイルに書ける項目は、どれでも`-P NAME=VALUE`で渡せます（`-P MODULATION=QAM/64`など）。
 書式は[channel-files.md](channel-files.md)と同じです。
 

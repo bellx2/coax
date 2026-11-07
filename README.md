@@ -145,6 +145,7 @@ Pass --tuners to open each board and confirm them.
 
 `--stats`を付けると、ロック、CNR、ビットレート、エラーとドロップを1秒ごとに標準エラーへ書きます（`./coax tune --ch 27 --stats | ffplay -`で、見ながら確認できます）。
 `--program`を付けると、今の番組と次の番組を、変わるたびに標準エラーへ書きます。
+`--input -`を付けると、選局せず標準入力のストリームを読むので、coaxが対応していないチューナーの出力にも`--program`と`--stats`を使えます（[tune.md](docs/reference/tune.md#受信済みのストリームを読む--input)）。
 
 #### チャンネルリストを作る（`coax scan`と`coax export`）
 
