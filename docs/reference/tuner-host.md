@@ -161,6 +161,7 @@ USBの受け渡し用のソケット（`--usb-socket`）は、HTTPのソケッ�
 | `rolloff` | `ROLLOFF` |
 | `gain` | `GAIN` |
 | `lna` | `LNA` |
+| `loop_through` | `LOOP_THROUGH` |
 
 `gain`と`lna`は別のキーとしてクエリの解析を通りますが、[同じ設定](channel-files.md#gainとlna)なので両方指定すると選局の直前にエラーになります。
 
@@ -246,6 +247,9 @@ leaseを持ったまま同じチューナーを指定して選局し直すと、
 デバイスの配列です。
 各デバイスは`name`、`naming`、`stable`、`backend`、`description`、`location`（bus/address）、`serial`、`port`、`deliveries`、`open`、`probed`、`probe_error`、`tuners`を持ちます。
 `location`は`lsusb`と照合するために出力しますが、カーネルが再割り当てするので名前には含めません。
+1つの筐体に2つのUSBデバイスがある機器（PX-W3U2・W3U3・W3U3 V2・Q3U4・Q3PE4・Q3PE5・MLT8PE）は、`enclosure`も持ちます。
+同じ筐体のデバイスは同じ値で、デバイスを開かずにUSBの一覧から決まります。
+1台で完結するデバイスには含まれません。
 
 ### `/tuners/{id}`
 
@@ -260,11 +264,13 @@ leaseを持ったまま同じチューナーを指定して選局し直すと、
 ```jsonc
 "controls": {
   // lnb_powerに指定できる値。offが無ければ給電を切れない。lowとhighの電圧（入切だけのデバイスは無し）。
-  // sharedは給電線を他のチューナーと共有する単位（"board"か"card"）。
+  // sharedは給電線を他のチューナーと共有する単位。"board"はデバイス、"card"はPCIeのカードかUSBの筐体（enclosureが同じデバイス）。
   "lnb":  {"levels": ["off","low","high"], "low": "11V", "high": "15V", "shared": "card"},
   // gain。"switch"は入切だけ（min／max／auto）、"steps"はdBの段（最も近い段に合わせる）。
   // deliveriesがあれば、その方式のときだけ効く（片側の入力にだけ増幅器があるデバイス）。
-  "gain": {"kind": "steps", "decibels": [0, 1, 2, 3], "deliveries": ["ISDB-S"]}
+  "gain": {"kind": "steps", "decibels": [0, 1, 2, 3], "deliveries": ["ISDB-S"]},
+  // loop_through。"steps"はmax／high／mid／lowの4段、"switch"は入切だけ（lowが切、それ以外が入）。
+  "loop_through": {"kind": "steps"}
 }
 ```
 
@@ -597,6 +603,7 @@ MirakurunはSIGTERMで止めるので、`coax tune`はSIGTERMで接続を閉じ�
 | `--allow-remote` | `--http`にループバック以外を許す | 不許可 |
 | `--firmware-dir` | ファームウェアの置き場所 | OSごとの既定 |
 | `--dvb-root` | Linux DVBのデバイスノードの場所。他OSでは無視 | `/dev/dvb` |
+| `--dvb-relative-streams` | Linux DVBのTC90522とMN88443xのドライバーに、ISDB-Sの相対TS番号をそのまま渡す。相対TS番号を読めるように手を入れたドライバー向け（[dvb.md](../boards/dvb.md#isdb-sのstream_id)）。他OSでは無視 | 渡さない（エラーにする） |
 | `--chardev-root` | px4_drv、pt3のキャラクタデバイスの場所。他OSでは無視 | `/dev` |
 | `--board-linger` | 最後の利用者がいなくなってからデバイスを開いておく時間。`0`ですぐに閉じる | 10秒 |
 | `--idle` | 合計この時間だけ使われなければ終了。`0`で常駐 | 15秒 |

@@ -5,9 +5,9 @@
 
 // Package tc90522 drives the Toshiba TC90522 ISDB-T/ISDB-S demodulator.
 //
-// The chip carries two independent demodulator cores, each on its own I2C
-// address, so one Demod is one core. Each repeats I2C to the tuner behind it,
-// which TunerBus exposes as an ordinary bus.
+// The chip carries two terrestrial and two satellite demodulator cores, each
+// on its own I2C address, so one Demod is one core. Each repeats I2C to the
+// tuner behind it, which TunerBus exposes as an ordinary bus.
 package tc90522
 
 import (
@@ -18,9 +18,8 @@ import (
 	"github.com/Till0196/coax/pkg/i2c"
 )
 
-// InitTerrestrial is the register sequence a terrestrial core needs at power-up
-// on the boards this chip appears on; boards needing extra pairs append to a
-// copy.
+// InitTerrestrial is a preset shared by several USB boards. Each board selects
+// and adjusts it as part of its own initialization.
 var InitTerrestrial = []byte{
 	0xb0, 0xa0, 0xb2, 0x3d, 0xb3, 0x25, 0xb4, 0x8b,
 	0xb5, 0x4b, 0xb6, 0x3f, 0xb7, 0xff, 0xb8, 0xc0,
@@ -42,6 +41,83 @@ func New(bus i2c.Bus, address byte, secondary bool) *Demod {
 	return &Demod{bus: bus, address: address, secondary: secondary}
 }
 
+// Tuner identifies the acquisition sequence used with an RF tuner.
+type Tuner uint8
+
+const (
+	TunerFC0012 Tuner = iota
+	TunerNM120
+	TunerQM1D1B0004
+	TunerTDA20142
+)
+
+// Tune holds gain control while setParams moves the RF tuner, applies any
+// board connections in finish, and restarts acquisition. The callbacks run
+// without the register lock so they can use the demodulator's tuner bus.
+func (demod *Demod) Tune(tuner Tuner, setParams, finish func() error) error {
+	var hold, resume []byte
+	switch tuner {
+	case TunerFC0012:
+		hold = []byte{0x25, 0x00, 0x23, 0x4d}
+		resume = []byte{0x01, 0x40, 0x23, 0x4c}
+	case TunerQM1D1B0004:
+		hold = []byte{0x25, 0x00, 0x23, 0x4d}
+		resume = []byte{0x03, 0x01, 0x23, 0x4c}
+	case TunerNM120:
+		hold = []byte{0x01, 0x50, 0x47, 0x30, 0x25, 0x00, 0x20, 0x00, 0x23, 0x4d}
+		resume = []byte{0x23, 0x4c, 0x01, 0x50, 0x71, 0x01, 0x72, 0x24, 0x75, 0x02}
+	case TunerTDA20142:
+	default:
+		return fmt.Errorf("TC90522 unsupported tuner %d", tuner)
+	}
+	var err error
+	if tuner == TunerTDA20142 {
+		err = demod.SetAGCS(false)
+	} else {
+		err = demod.WritePairs(hold)
+	}
+	if err != nil {
+		return err
+	}
+	if err := setParams(); err != nil {
+		return err
+	}
+	if finish != nil {
+		if err := finish(); err != nil {
+			return err
+		}
+	}
+	if tuner == TunerTDA20142 {
+		return demod.SetAGCS(true)
+	}
+	return demod.WritePairs(resume)
+}
+
+// ResetTuner pulses the terrestrial RF control while preserving its other bits.
+func (demod *Demod) ResetTuner() error {
+	value, err := demod.ReadRegister(0x1c)
+	if err != nil {
+		return err
+	}
+	if err := demod.WriteRegister(0x1c, value|0x30); err != nil {
+		return err
+	}
+	time.Sleep(10 * time.Millisecond)
+	if err := demod.WriteRegister(0x1c, (value|0x20)&^0x10); err != nil {
+		return err
+	}
+	time.Sleep(10 * time.Millisecond)
+	return nil
+}
+
+// SetFC0012Band selects the terrestrial AGC range for the RF frequency in Hz.
+func (demod *Demod) SetFC0012Band(frequency uint32) error {
+	if frequency <= 260_999_000 {
+		return demod.WriteRegisterMask(0x1e, 0x20, 0x30)
+	}
+	return demod.WriteRegisterMask(0x1e, 0x30, 0x30)
+}
+
 // ReadRegisters reads a run of registers.
 func (demod *Demod) ReadRegisters(register byte, length int) ([]byte, error) {
 	demod.mu.Lock()
@@ -53,7 +129,7 @@ func (demod *Demod) readRegisters(register byte, length int) ([]byte, error) {
 	if length <= 0 {
 		return nil, fmt.Errorf("TC90522 register read length %d is invalid", length)
 	}
-	data, err := i2c.WriteRead(demod.bus, demod.address, []byte{register}, length)
+	data, err := i2c.ReadRegisters(demod.bus, demod.address, register, length)
 	if err != nil {
 		return nil, err
 	}
@@ -175,10 +251,14 @@ func (demod *Demod) SetAGCS(on bool) error {
 	return demod.WritePairs(pairs)
 }
 
-// TMCCTSIDS reads one of the twelve TSIDs the TMCC carries.
+// TMCCSlots is how many streams the TMCC lists, by relative number; a slot
+// carrying none reads 0xffff, or 0 before the block has been received.
+const TMCCSlots = 8
+
+// TMCCTSIDS reads the TSID in one slot of the TMCC.
 func (demod *Demod) TMCCTSIDS(index int) (uint16, error) {
-	if index < 0 || index >= 12 {
-		return 0, fmt.Errorf("TC90522 TMCC slot %d is outside 0..11", index)
+	if index < 0 || index >= TMCCSlots {
+		return 0, fmt.Errorf("TC90522 TMCC slot %d is outside 0..%d", index, TMCCSlots-1)
 	}
 	data, err := demod.ReadRegisters(byte(0xce+index*2), 2)
 	if err != nil {
@@ -203,14 +283,17 @@ func (demod *Demod) SetTSIDS(tsid uint16) error {
 
 // SelectStreamS tells the satellite core which stream to demultiplex, waiting
 // until it has settled. Values below 12 name a TMCC slot rather than a TSID and
-// are resolved once the TMCC block has been received.
+// are resolved once the TMCC block has been received; the TMCC has eight.
 func (demod *Demod) SelectStreamS(streamID uint16) error {
 	tsid := streamID
 	if streamID < 12 {
+		if streamID >= TMCCSlots {
+			return fmt.Errorf("stream %d names a TMCC slot, and the TMCC has %d", streamID, TMCCSlots)
+		}
 		var err error
 		for attempt := 0; attempt < 100; attempt++ {
 			tsid, err = demod.TMCCTSIDS(int(streamID))
-			if err == nil && tsid != 0 {
+			if err == nil && tsid != 0 && tsid != 0xffff {
 				break
 			}
 			time.Sleep(10 * time.Millisecond)
@@ -218,7 +301,7 @@ func (demod *Demod) SelectStreamS(streamID uint16) error {
 		if err != nil {
 			return fmt.Errorf("read TMCC slot %d: %w", streamID, err)
 		}
-		if tsid == 0 {
+		if tsid == 0 || tsid == 0xffff {
 			return fmt.Errorf("TMCC slot %d carries no stream", streamID)
 		}
 	}

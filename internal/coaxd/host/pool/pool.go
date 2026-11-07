@@ -86,6 +86,9 @@ type Detected struct {
 	Location string
 	// USB is the vendor and product, zero for anything that is not USB.
 	USB usbio.ID
+	// Enclosure is the same for every board of one enclosure, and empty for a
+	// board that stands alone.
+	Enclosure string
 	// Deliveries are the delivery systems the hardware is known to reach, before
 	// it is opened and asked.
 	Deliveries []string
@@ -97,6 +100,10 @@ type Detected struct {
 	Exclusive bool
 	// Tuners is the layout as far as it can be told without opening the device.
 	Tuners []device.TunerInfo
+	// CardSlot marks the device a card slot is reached through, for a backend
+	// whose devices carry one only now and then: a PLEX enclosure on its BDA
+	// driver is four tuners and one slot.
+	CardSlot bool
 }
 
 // Registry is where the pool finds hardware, named as an interface so that the

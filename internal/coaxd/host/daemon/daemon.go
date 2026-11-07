@@ -25,6 +25,7 @@ import (
 	"github.com/Till0196/coax/internal/coaxd/host/native"
 	"github.com/Till0196/coax/internal/coaxd/host/pool"
 	"github.com/Till0196/coax/internal/coaxd/host/server"
+	"github.com/Till0196/coax/internal/coaxd/host/session"
 	"github.com/Till0196/coax/internal/coaxd/host/tray"
 	"github.com/Till0196/coax/internal/coaxd/usb"
 	"github.com/Till0196/coax/internal/idle"
@@ -57,6 +58,9 @@ type Options struct {
 	ChardevRoot string
 	// DVBRoot is where the Linux DVB device nodes are, empty for /dev/dvb.
 	DVBRoot string
+	// DVBRelativeStreams passes an ISDB-S stream's place on the transponder to
+	// the Linux DVB drivers that would otherwise take it as an identifier.
+	DVBRelativeStreams bool
 	// FirmwareDir holds the blobs the firmware-loading boards need.
 	FirmwareDir string
 	// Linger is how long a board stays open after its last user goes.
@@ -100,8 +104,15 @@ func Run(ctx context.Context, options Options) error {
 	// it by cancelling this. One way out, so one teardown to get right.
 	ctx, asked := context.WithCancel(ctx)
 	defer asked()
+	finishSession, err := session.Watch(asked)
+	if err != nil {
+		return err
+	}
+	// Registered before resource cleanup, so Windows is answered last.
+	defer finishSession()
 
 	native.SetRoot(options.DVBRoot)
+	native.SetRelativeStreams(options.DVBRelativeStreams)
 	native.SetChardevRoot(options.ChardevRoot)
 	native.SetSocket(options.Sockets.HTTP)
 
@@ -526,6 +537,7 @@ func usbBoards() ([]pool.Detected, error) {
 			Port:        one.Port,
 			Location:    one.Device,
 			USB:         one.ID,
+			Enclosure:   one.Enclosure,
 			Deliveries:  one.Deliveries,
 			Tuners:      usb.Layout(one.Backend, one.ID),
 		})

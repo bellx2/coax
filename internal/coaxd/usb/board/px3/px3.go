@@ -5,8 +5,7 @@
 // exposes one ISDB-S and one ISDB-T tuner; a four-tuner enclosure appears as
 // two USB devices.
 //
-// Two generations of board share the bridge and little else, and what differs
-// is in wiring, below. None of these receivers has been seen here.
+// Model-specific connections and register settings are described by wiring.
 //
 // The two tuners are independent down to their stream endpoints, so unlike the
 // US-3POUT both can be tuned and streamed at once. They contend only for the
@@ -17,7 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sync"
+	"slices"
 	"time"
 
 	"github.com/Till0196/coax/internal/coaxd/demod/tc90522"
@@ -45,6 +44,7 @@ var Backend = usbdev.Backend{
 	Boot:        boot,
 	Supports:    Supports,
 	Layout:      Layout,
+	Enclosure:   enclosureName,
 	Open:        open,
 }
 
@@ -52,16 +52,29 @@ var Backend = usbdev.Backend{
 // this backend claims carries both.
 func Layout(id usbio.ID) []device.TunerInfo {
 	wired := wiringFor(id.Product)
-	// The supply is the enclosure's one line, in or out. The gain is the V2's
-	// external amplifiers (in or out, both tuners), or on the older boards the
-	// FC0012's ladder on the terrestrial tuner (frontend.GainLadder).
-	satelliteControls := device.Controls{LNB: &device.LNBControl{Off: true, Shared: "board"}}
+	// The supply is in or out, and an enclosure of two bridges feeds one lead
+	// from it. The gain is the V2's external amplifiers (in or out, both
+	// tuners), or on the FC0012 boards the FC0012's ladder on the terrestrial
+	// tuner (frontend.GainLadder).
+	supply := "board"
+	if twoBridges(id.Product) {
+		supply = "card"
+	}
+	satelliteControls := device.Controls{LNB: &device.LNBControl{Off: true, Shared: supply}}
+	if wired.noLNBControl {
+		satelliteControls.LNB = nil
+	}
 	terrestrialControls := device.Controls{}
+	// The loop-through output is each tuner's own: the V2's NM120 and TDA20142
+	// have four levels, the FC0012 is on or off, the QM1D1B0004 has none.
 	if wired.externalAmplifier != nil {
 		satelliteControls.Gain = &device.GainControl{}
 		terrestrialControls.Gain = &device.GainControl{}
+		satelliteControls.LoopThrough = &device.LoopThroughControl{}
+		terrestrialControls.LoopThrough = &device.LoopThroughControl{}
 	} else {
 		terrestrialControls.Gain = &device.GainControl{Decibels: fc0012.GainStepsDB()}
+		terrestrialControls.LoopThrough = &device.LoopThroughControl{Switch: true}
 	}
 	return []device.TunerInfo{
 		{Index: satellite, Name: wired.satelliteName, Deliveries: []string{"ISDB-S"}, Controls: satelliteControls},
@@ -90,32 +103,42 @@ const (
 	terrestrial = 1
 )
 
-// wiring is what differs between the two generations. None of it has been checked
-// against hardware.
+// wiring describes the tuner connections and board settings of each generation.
 type wiring struct {
 	// demodTerrestrial and demodSatellite are the bus targets the two TC90522 cores
-	// answer on: 0x30 and 0x32 on the older boards, 0x20 and 0x22 on the V2.
+	// answer on: 0x30 and 0x32 on the FC0012 boards, 0x20 and 0x22 on the V2.
 	demodTerrestrial, demodSatellite byte
 	// newTerrestrial builds the ISDB-T tuner: an FC0012 at 0xc6 with eight-bit
-	// registers on the older boards, a Newport Media part at 0xce with sixteen-bit
+	// registers on the FC0012 boards, a Newport Media part at 0xce with sixteen-bit
 	// ones on the V2.
 	newTerrestrial func(bus i2c.Bus, demod byte) (terrestrialTuner, error)
 	// newSatellite builds the ISDB-S tuner on the demodulator's tuner bus: a
-	// TDA20142 on the V2, a table-driven part on the older boards (satellite.go).
+	// TDA20142 on the V2, a table-driven part on the FC0012 boards (satellite.go).
 	newSatellite func(bus i2c.Bus) (satelliteTuner, error)
+	// beforeRF and afterRF configure the demodulators around RF initialization.
+	beforeRF, afterRF []demodSetup
+	// tuners select the demodulator's acquisition sequence. afterTune applies
+	// board connections after RF tuning and before acquisition restarts.
+	tuners    [2]tc90522.Tuner
+	afterTune [2][]demodSetup
 	// lnbSupplyOn is what to put on GPIO bit 0x20 to feed the aerial lead. The two
-	// generations are opposite: zero on the older boards, the bit itself on the V2.
+	// generations are opposite: zero on the FC0012 boards, the bit itself on the V2.
 	lnbSupplyOn byte
+	// noLNBControl marks the PX-S3U and PX-S3U2, whose supply no software
+	// switches: the PX-S3U2 feeds the dish whenever its AC adapter is connected.
+	// GPIO 0x20 is only stepped through at power-up there and is left alone.
+	noLNBControl bool
 	// externalAmplifier is the board-level amplifier lines. Only the V2 has a pair.
 	externalAmplifier *amplifierLines
-	// terrestrialTuned is what goes to the terrestrial demodulator once its
-	// tuner has settled. The V2 streams nothing at all with the older boards'
-	// values: 0x71 and 0x72 take the values below and 0x75 stays at the 0x02
-	// the core was brought up with; with 0x71 = 0x21 or 0x75 = 0x08 the bridge
-	// receives no packets.
-	terrestrialTuned []byte
 	// terrestrialName and satelliteName are what a listing calls the two tuners.
 	terrestrialName, satelliteName string
+}
+
+type demodSetup struct {
+	index   int
+	address byte // Zero uses the indexed demodulator's address.
+	tuner   byte // Zero addresses the demodulator; otherwise use its tuner bus.
+	pairs   []byte
 }
 
 // amplifierLines is how a generation switches its board-level amplifiers: a
@@ -143,8 +166,8 @@ type satelliteTuner interface {
 	Tune(frequencyKHz uint64) error
 }
 
-// amplifier is a tuner whose gain can be moved. Only the FC0012 on the older
-// boards has one this program can drive, so a channel asking any other tuner
+// amplifier is a tuner whose gain can be moved. Only the FC0012
+// has one this program can drive, so a channel asking any other tuner
 // for gain is told so. What is known of the V2's gain settings is in px3.md.
 type amplifier interface {
 	SetLNAGain(step int) error
@@ -156,10 +179,67 @@ const isdbtBandwidthHz = 6_000_000
 
 // fc0012Tuner fixes the channel width, leaving the one-argument shape the board
 // uses.
-type fc0012Tuner struct{ *fc0012.Tuner }
+type fc0012Tuner struct {
+	*fc0012.Tuner
+	w3                      bool
+	gain                    int
+	manualGain, gainApplied bool
+}
 
-func (tuner fc0012Tuner) Tune(frequencyHz uint32) error {
+func (tuner *fc0012Tuner) Tune(frequencyHz uint32) error {
+	if tuner.w3 {
+		// The channel centre has a 1/7 MHz offset from its integer MHz.
+		mhz := frequencyHz / 1_000_000
+		switch {
+		case mhz >= 165 && mhz <= 167:
+			mhz = 167
+		case mhz >= 195 && mhz <= 197:
+			mhz = 195
+		case mhz >= 471 && mhz <= 473:
+			mhz = 473
+		}
+		frequencyHz = mhz*1_000_000 + 143_000
+		if err := tuner.Tuner.SetLNAGain(tuner.gain); err != nil {
+			return err
+		}
+		tuner.gainApplied = false
+	}
 	return tuner.Tuner.Tune(frequencyHz, isdbtBandwidthHz)
+}
+
+func (tuner *fc0012Tuner) SetLNAGain(step int) error {
+	if err := tuner.Tuner.SetLNAGain(step); err != nil {
+		return err
+	}
+	tuner.gain = step
+	tuner.manualGain = true
+	return nil
+}
+
+// acquire retries RF calibration without releasing demodulator gain control.
+func (tuner *fc0012Tuner) acquire(demod *tc90522.Demod, frequencyHz uint32) error {
+	for attempt := 0; attempt < 4; attempt++ {
+		if err := tuner.Tune(frequencyHz); err != nil {
+			return err
+		}
+		if err := demod.SetFC0012Band(frequencyHz); err != nil {
+			return err
+		}
+		ready, err := tuner.Calibrated()
+		if err != nil {
+			return err
+		}
+		if ready || attempt == 3 {
+			return nil
+		}
+		if err := demod.ResetTuner(); err != nil {
+			return err
+		}
+		if err := tuner.Initialize(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func newFC0012(bus i2c.Bus, demod byte) (terrestrialTuner, error) {
@@ -167,7 +247,17 @@ func newFC0012(bus i2c.Bus, demod byte) (terrestrialTuner, error) {
 	if err := tuner.Initialize(); err != nil {
 		return nil, err
 	}
-	return fc0012Tuner{tuner}, nil
+	return &fc0012Tuner{Tuner: tuner, gain: fc0012.LNASteps - 1}, nil
+}
+
+func newW3FC0012(bus i2c.Bus, demod byte) (terrestrialTuner, error) {
+	tuner := fc0012.New(bus, demod, fc0012.Config{
+		DisableFixedClockOut: true, CalibrateRSSI: true, VCOLatchDelay: time.Millisecond,
+	})
+	if err := tuner.Initialize(); err != nil {
+		return nil, err
+	}
+	return &fc0012Tuner{Tuner: tuner, w3: true}, nil
 }
 
 func newNM120(bus i2c.Bus, demod byte) (terrestrialTuner, error) {
@@ -178,7 +268,7 @@ func newNM120(bus i2c.Bus, demod byte) (terrestrialTuner, error) {
 	return tuner, nil
 }
 
-// newTableSatellite is the older boards': nothing to initialize beyond the
+// newTableSatellite is the FC0012 boards': nothing to initialize beyond the
 // demodulator.
 func newTableSatellite(bus i2c.Bus) (satelliteTuner, error) {
 	return tableSatelliteTuner{tuner: newSatelliteTuner(bus)}, nil
@@ -188,16 +278,72 @@ func newTDA20142(bus i2c.Bus) (satelliteTuner, error) {
 	return tda20142.New(bus)
 }
 
-// olderWiring is the PX-S3U, S3U2, W3U2 and W3U3.
-var olderWiring = wiring{
-	demodTerrestrial: 0x30,
-	demodSatellite:   0x32,
-	newTerrestrial:   newFC0012,
-	newSatellite:     newTableSatellite,
-	lnbSupplyOn:      0x00,
-	terrestrialTuned: []byte{0x71, 0x21, 0x72, 0x25, 0x75, 0x08},
-	terrestrialName:  "FC0012",
-	satelliteName:    "QM1D1B0004",
+// fc0012WiringFor combines the shared terrestrial preset with the board's
+// defaults. Every call owns its register lists.
+func fc0012WiringFor(product uint16) wiring {
+	var terrestrialDefaults []byte
+	if product != 0x0001 && product != 0x0003 {
+		terrestrialDefaults = append(terrestrialDefaults,
+			0x04, 0x00, 0x11, 0x1a, 0x12, 0x04, 0x13, 0x33, 0x14, 0x20,
+			0x31, 0x00, 0x32, 0x00, 0x38, 0x00, 0x39, 0xaa)
+	}
+	terrestrialDefaults = append(terrestrialDefaults, 0x47, 0x00, 0x75, 0x02)
+	for at := 0; at < len(tc90522.InitTerrestrial); at += 2 {
+		register, value := tc90522.InitTerrestrial[at], tc90522.InitTerrestrial[at+1]
+		if register == 0xb8 {
+			value = 0xff
+		}
+		terrestrialDefaults = append(terrestrialDefaults, register, value)
+	}
+	terrestrialDefaults = append(terrestrialDefaults, 0x22, 0x8f, 0x5f, 0x80, 0xef, 0x01)
+	satelliteDefaults := demodSetup{index: satellite, pairs: []byte{
+		0x01, 0x90, 0x03, 0x00, 0x04, 0x02, 0x06, 0x00, 0x07, 0x41, 0x08, 0x00,
+		0x09, 0x00, 0x0a, 0xff, 0x0c, 0x59, 0x0d, 0xf2, 0x0e, 0xf0, 0x0f, 0x50,
+		0x10, 0xb2, 0x11, 0x00, 0x12, 0x30, 0x13, 0x80, 0x14, 0x00, 0x15, 0x00,
+		0x17, 0x00, 0x1a, 0x00, 0x1b, 0x00, 0x1c, 0x00, 0x1d, 0x00, 0x1e, 0x00,
+		0x1f, 0x00, 0x20, 0x00, 0x38, 0x40, 0x39, 0x10, 0x3b, 0x90, 0x51, 0xb0,
+		0x52, 0x89, 0x53, 0xb3, 0x5a, 0x2d, 0x5b, 0xd3, 0x85, 0x69, 0x87, 0x04,
+		0x8d, 0x00, 0x8e, 0x00, 0xa3, 0x11, 0xa4, 0x00, 0xa5, 0x40, 0xa6, 0x04,
+	}}
+	wired := wiring{
+		demodTerrestrial: 0x30,
+		demodSatellite:   0x32,
+		newTerrestrial:   newW3FC0012,
+		newSatellite:     newTableSatellite,
+		beforeRF: []demodSetup{
+			{index: terrestrial, pairs: terrestrialDefaults},
+		},
+		afterRF: []demodSetup{
+			satelliteDefaults,
+			{index: terrestrial, pairs: []byte{0x0f, 0x34}},
+		},
+		tuners: [2]tc90522.Tuner{satellite: tc90522.TunerQM1D1B0004, terrestrial: tc90522.TunerFC0012},
+		afterTune: [2][]demodSetup{
+			satellite:   {{index: terrestrial, pairs: []byte{0x0f, 0x34}}},
+			terrestrial: {{index: terrestrial, pairs: []byte{0x0f, 0x34}}},
+		},
+		lnbSupplyOn:     0x00,
+		terrestrialName: "FC0012",
+		satelliteName:   "QM1D1B0004",
+	}
+	if product == 0x0001 || product == 0x0003 {
+		wired.noLNBControl = true
+	}
+	if product == 0x0001 {
+		wired.newTerrestrial = newFC0012
+		wired.beforeRF = []demodSetup{
+			satelliteDefaults,
+			{index: terrestrial, pairs: terrestrialDefaults},
+		}
+		wired.afterRF = nil
+		wired.afterTune[terrestrial] = []demodSetup{{index: terrestrial, pairs: []byte{0x0f, 0x14}}}
+		wired.afterTune[satellite] = []demodSetup{{index: terrestrial, address: 0x34, pairs: []byte{0x0f, 0x3c}}}
+	} else if product == 0x0003 {
+		wired.newTerrestrial = newFC0012
+		pulse := demodSetup{index: terrestrial, tuner: 0xc6, pairs: []byte{0x10, 0x00, 0x10, 0x10, 0x10, 0x00}}
+		wired.afterRF = []demodSetup{pulse, satelliteDefaults, pulse, {index: terrestrial, pairs: []byte{0x0f, 0x34}}}
+	}
+	return wired
 }
 
 // v2Wiring is the PX-W3U3 V2's first pair. Its demodulators sit at
@@ -205,13 +351,21 @@ var olderWiring = wiring{
 // behind the odd one, so the terrestrial side is unit zero; the second pair is
 // units two and three. See v2WiringAt.
 var v2Wiring = wiring{
-	demodTerrestrial:  0x20,
-	demodSatellite:    0x22,
-	newTerrestrial:    newNM120,
-	newSatellite:      newTDA20142,
+	demodTerrestrial: 0x20,
+	demodSatellite:   0x22,
+	newTerrestrial:   newNM120,
+	newSatellite:     newTDA20142,
+	beforeRF: []demodSetup{
+		{index: terrestrial, pairs: tc90522.InitTerrestrial},
+		{index: terrestrial, pairs: []byte{0x03, 0, 0x1d, 0, 0x1f, 0, 0x0e, 0x77, 0x0f, 0x13, 0x75, 0x02}},
+	},
+	afterRF: []demodSetup{
+		{index: terrestrial, pairs: []byte{0x0e, 0x77, 0x0f, 0x13}},
+		{index: satellite, pairs: []byte{0x13, 0, 0x15, 0, 0x17, 0, 0x1c, 0, 0x1d, 0, 0x1f, 0, 0x07, 0x31, 0x08, 0x77, 0x04, 0x02}},
+	},
+	tuners:            [2]tc90522.Tuner{satellite: tc90522.TunerTDA20142, terrestrial: tc90522.TunerNM120},
 	lnbSupplyOn:       lnbSupplyMask,
 	externalAmplifier: &v2Amplifiers,
-	terrestrialTuned:  []byte{0x71, 0x01, 0x72, 0x24, 0x75, 0x02},
 	terrestrialName:   "NM120",
 	satelliteName:     "TDA20142",
 }
@@ -230,10 +384,10 @@ func v2WiringAt(at int) wiring {
 }
 
 func wiringFor(product uint16) wiring {
-	if product == 0x0006 {
+	if product == v2Product {
 		return v2Wiring
 	}
-	return olderWiring
+	return fc0012WiringFor(product)
 }
 
 var products = map[uint16]string{
@@ -284,55 +438,36 @@ func open(options device.Options) (device.Board, error) {
 		return fail("open", fmt.Errorf("unsupported product ID %#04x", product))
 	}
 
-	hardware := &hardware{bridge: bridge, control: bridge, wired: wiringFor(product), chips: &tsChips{}}
-	hardware.amplifierOn = [2]bool{true, true}
-	if product == v2Product {
-		at, err := position(bridge)
-		if err != nil {
-			return fail("open PLEX "+model, err)
+	if product == 0x0004 || product == 0x0005 || product == v2Product {
+		if _, err := siblingOf(own.location, product); err != nil {
+			if product != v2Product {
+				warm, err := usbio.Resolve(own.location, supportedIDs)
+				if err != nil {
+					return fail("locate enclosure", err)
+				}
+				if _, err := restoreBootSibling(warm); err != nil {
+					return fail("restore enclosure sibling", err)
+				}
+			}
+			if err := boot(options); err != nil {
+				return fail("boot enclosure sibling", err)
+			}
 		}
-		trace.Printf("px3 %s: PX-W3U3 V2 bridge at position %d", bridge.Name(), at)
-		shared, err := openV2Enclosure(own, at)
-		if err != nil {
-			trace.Printf("px3 %s: %v", bridge.Name(), err)
-			return fail("open PLEX "+model, err)
-		}
-		trace.Printf("px3 %s: driven through %s, demodulators %#02x/%#02x", bridge.Name(),
-			shared.controller.location, shared.pairs[at%2].wired.demodTerrestrial, shared.pairs[at%2].wired.demodSatellite)
-		releases = append(releases, shared.release)
-		ends := shared.pairs[at%2]
-		hardware.control = shared.controller.bridge
-		hardware.v2 = true
-		hardware.at = at
-		hardware.wired = ends.wired
-		hardware.demodT, hardware.demodS = ends.demodT, ends.demodS
-		hardware.tunerT, hardware.tunerS = ends.tunerT, ends.tunerS
-		hardware.lnb = shared.lnb
-		hardware.chips = &shared.chips
-	} else {
-		supplyOn := hardware.wired.lnbSupplyOn
-		supplyOff := ^supplyOn & lnbSupplyMask
-		hardware.lnb = device.NewLatch(
-			func() error { return bridge.SetGPIO(supplyOn, lnbSupplyMask) },
-			func() error { return bridge.SetGPIO(supplyOff, lnbSupplyMask) },
-		)
-		if err := hardware.reset(product); err != nil {
-			return fail("reset PLEX "+model, err)
-		}
-		ends, err := newFrontEnds(bridge, hardware.wired, olderSatelliteInit)
-		if err != nil {
-			return fail("open PLEX "+model, err)
-		}
-		hardware.demodT, hardware.demodS = ends.demodT, ends.demodS
-		hardware.tunerT, hardware.tunerS = ends.tunerT, ends.tunerS
 	}
-	// Both amplifiers are meant to come up on, and the reset sequence leaves their
-	// lines wherever they were.
-	if err := hardware.setExternalAmplifier(terrestrial, true); err != nil {
-		return fail("switch the terrestrial amplifier on", err)
+
+	shared, at, err := openEnclosure(own)
+	if err != nil {
+		return fail("open PLEX "+model, err)
 	}
-	if err := hardware.setExternalAmplifier(satellite, true); err != nil {
-		return fail("switch the satellite amplifier on", err)
+	releases = append(releases, shared.release)
+	pair := shared.pairs[at%2]
+	ends := pair.frontEnds
+	hardware := &hardware{
+		bridge: bridge, controller: pair.controller, frontEnds: ends,
+		v2: product == v2Product, at: at,
+	}
+	if err := hardware.restoreExternalAmplifiers(terrestrial, satellite); err != nil {
+		return fail("restore the amplifier settings", err)
 	}
 	// Leave both TS outputs off until a tuner actually streams.
 	_ = hardware.demodT.EnableTSPinsT(false)
@@ -361,34 +496,6 @@ func open(options device.Options) (device.Board, error) {
 	return &board{Board: inner, hardware: hardware}, nil
 }
 
-// olderSatelliteInit is what the older boards write to their satellite
-// demodulator once the tuners are up.
-var olderSatelliteInit = []byte{0x15, 0, 0x1d, 0, 0x04, 0x02, 0x07, 0x31, 0x08, 0x77}
-
-// newFrontEnds brings up one pair of demodulators and tuners, reached through
-// control.
-func newFrontEnds(control *asv5211.Bridge, wired wiring, satelliteInit []byte) (frontEnds, error) {
-	ends := frontEnds{wired: wired}
-	terrestrialBus := control.I2C(wired.demodTerrestrial)
-	satelliteBus := control.I2C(wired.demodSatellite)
-	ends.demodT = tc90522.New(terrestrialBus, wired.demodTerrestrial, false)
-	ends.demodS = tc90522.New(satelliteBus, wired.demodSatellite, false)
-	var err error
-	if ends.tunerT, err = wired.newTerrestrial(terrestrialBus, wired.demodTerrestrial); err != nil {
-		return frontEnds{}, fmt.Errorf("initialize the terrestrial tuner behind %#02x: %w", wired.demodTerrestrial, err)
-	}
-	if ends.tunerS, err = wired.newSatellite(ends.demodS.TunerBus()); err != nil {
-		return frontEnds{}, fmt.Errorf("initialize the satellite tuner behind %#02x: %w", wired.demodSatellite, err)
-	}
-	if err := ends.demodT.WritePairs([]byte{0x0e, 0x77, 0x0f, 0x13}); err != nil {
-		return frontEnds{}, fmt.Errorf("initialize terrestrial TC90522: %w", err)
-	}
-	if err := ends.demodS.WritePairs(satelliteInit); err != nil {
-		return frontEnds{}, fmt.Errorf("initialize satellite TC90522: %w", err)
-	}
-	return ends, nil
-}
-
 // board is the boardkit handle with the enclosure's card reader alongside it.
 // One slot serves however many tuners the enclosure carries, so the reader is
 // board-level.
@@ -399,39 +506,15 @@ type board struct {
 
 // hardware is the silicon on one ASV52xx board, shared by its two tuners.
 type hardware struct {
+	*controller
+	frontEnds
 	// bridge is the one this board's streams arrive on.
 	bridge *asv5211.Bridge
-	// control is the one its demodulators, tuners and GPIO lines are reached
-	// through: bridge itself, except on a V2's second bridge, which borrows the
-	// first's.
-	control *asv5211.Bridge
 	// v2 marks a PX-W3U3 V2, whose channel filters are set up a little
 	// differently.
 	v2 bool
 	// at is a V2 bridge's position in its enclosure.
 	at int
-	// chips is the card interface IC each tuner's stream passes through: the
-	// enclosure's on a V2, whose two bridges share them, this board's own
-	// otherwise.
-	chips *tsChips
-	// slowdown is the V2's TS rate converter on the controlling bridge's bus,
-	// looked for on the first stream.
-	slowdown struct {
-		sync.Mutex
-		probed, present bool
-	}
-	wired  wiring
-	demodT *tc90522.Demod
-	demodS *tc90522.Demod
-	tunerT terrestrialTuner
-	tunerS satelliteTuner
-	// lnb counts the tuners asking for satellite power.
-	lnb *device.Latch
-	// card is the enclosure's smart card reader, brought up on first use.
-	card card
-	// amplifierOn is what each tuner's amplifier was last asked for, so a tune can
-	// put the line back: bringing the card reader up pulses the same GPIO bank.
-	amplifierOn [2]bool
 }
 
 // setExternalAmplifier switches one of the board-level amplifiers, and does
@@ -441,7 +524,34 @@ func (hardware *hardware) setExternalAmplifier(index int, on bool) error {
 	if lines == nil {
 		return nil
 	}
-	hardware.amplifierOn[index] = on
+	hardware.amplifiers.Lock()
+	defer hardware.amplifiers.Unlock()
+	if err := hardware.writeExternalAmplifier(index, on); err != nil {
+		return err
+	}
+	hardware.amplifiers.on[index] = on
+	return nil
+}
+
+func (hardware *hardware) restoreExternalAmplifiers(indices ...int) error {
+	if hardware.wired.externalAmplifier == nil {
+		if tuner, ok := hardware.tunerT.(*fc0012Tuner); ok && tuner.w3 && slices.Contains(indices, terrestrial) {
+			return hardware.control.SetGPIO(0, 0x01)
+		}
+		return nil
+	}
+	hardware.amplifiers.Lock()
+	defer hardware.amplifiers.Unlock()
+	for _, index := range indices {
+		if err := hardware.writeExternalAmplifier(index, hardware.amplifiers.on[index]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (hardware *hardware) writeExternalAmplifier(index int, on bool) error {
+	lines := hardware.wired.externalAmplifier
 	extended, value, mask := lines.request(index, on)
 	if extended {
 		return hardware.control.SetGPIOEx(value, mask)
@@ -463,83 +573,6 @@ func (lines *amplifierLines) request(index int, on bool) (extended bool, value, 
 		value = ^value & mask
 	}
 	return extended, value, mask
-}
-
-// gpioStep is one masked GPIO write of a power-up sequence and the settle after
-// it.
-type gpioStep struct {
-	extended    bool
-	value, mask byte
-	wait        time.Duration
-}
-
-// resetSequences holds the power-up sequence each product needs. They differ
-// enough that there is no useful common prefix.
-var resetSequences = map[uint16][]gpioStep{
-	// PX-S3U
-	0x0001: {
-		{value: 0, mask: 0x08, wait: 50 * time.Millisecond},
-		{value: 0x44, mask: 0x44, wait: 50 * time.Millisecond},
-		{value: 0, mask: 0x44, wait: 50 * time.Millisecond},
-		{value: 0x44, mask: 0x44, wait: 50 * time.Millisecond},
-		{value: 0, mask: 0x20, wait: 100 * time.Millisecond},
-		{value: 0x20, mask: 0x20, wait: 100 * time.Millisecond},
-	},
-	// PX-S3U2
-	0x0003: {
-		{value: 0x05, mask: 0x05, wait: 10 * time.Millisecond},
-		{value: 0, mask: 0x04, wait: 10 * time.Millisecond},
-		{value: 0x05, mask: 0x05, wait: 10 * time.Millisecond},
-		{value: 0, mask: 0x20, wait: 10 * time.Millisecond},
-		{value: 0x20, mask: 0x20, wait: 10 * time.Millisecond},
-		{value: 0, mask: 0x20, wait: 10 * time.Millisecond},
-		{value: 0x10, mask: 0x10, wait: 10 * time.Millisecond},
-		{value: 0, mask: 0x10, wait: 10 * time.Millisecond},
-		{value: 0x10, mask: 0x10, wait: 10 * time.Millisecond},
-		{extended: true, value: 0, mask: 0x01, wait: 10 * time.Millisecond},
-		{value: 0x40, mask: 0x40, wait: 10 * time.Millisecond},
-		{value: 0, mask: 0x40, wait: 10 * time.Millisecond},
-		{value: 0x40, mask: 0x40, wait: 10 * time.Millisecond},
-		{value: 0, mask: 0x80, wait: 10 * time.Millisecond},
-		{value: 0x80, mask: 0x80, wait: 10 * time.Millisecond},
-		{value: 0, mask: 0x80, wait: 10 * time.Millisecond},
-		{extended: true, value: 0, mask: 0x02, wait: 100 * time.Millisecond},
-	},
-	// PX-W3U2 and PX-W3U3
-	0x0004: pxW3U2Sequence,
-	0x0005: pxW3U2Sequence,
-}
-
-var pxW3U2Sequence = []gpioStep{
-	{value: 0x05, mask: 0x05, wait: 10 * time.Millisecond},
-	{value: 0, mask: 0x04, wait: 10 * time.Millisecond},
-	{value: 0x05, mask: 0x05, wait: 10 * time.Millisecond},
-	{value: 0x10, mask: 0x10, wait: 10 * time.Millisecond},
-	{value: 0, mask: 0x10, wait: 10 * time.Millisecond},
-	{value: 0x10, mask: 0x10, wait: 10 * time.Millisecond},
-	{value: 0x20, mask: 0x20, wait: 110 * time.Millisecond},
-}
-
-// reset walks the product's power-up sequence. The V2 has its own, run on the
-// enclosure rather than the bridge: see bringUpV2.
-func (hardware *hardware) reset(product uint16) error {
-	steps, known := resetSequences[product]
-	if !known {
-		return fmt.Errorf("no power-up sequence for product ID %#04x", product)
-	}
-	for _, step := range steps {
-		write := hardware.bridge.SetGPIO
-		if step.extended {
-			write = hardware.bridge.SetGPIOEx
-		}
-		if err := write(step.value, step.mask); err != nil {
-			return err
-		}
-		if step.wait != 0 {
-			time.Sleep(step.wait)
-		}
-	}
-	return nil
 }
 
 // frontend is one of the board's two tuners.
@@ -572,13 +605,27 @@ func (front *frontend) Tune(properties map[string]string) error {
 	if delivery != wanted {
 		return fmt.Errorf("ASV52xx tuner %d does not support %q", front.index, properties["DELIVERY_SYSTEM"])
 	}
+	if front.index == terrestrial {
+		if tuner, ok := front.hardware.tunerT.(*fc0012Tuner); ok && tuner.w3 {
+			gain, err := tuning.ParseGain(properties)
+			if err != nil {
+				return err
+			}
+			if gain.Kind == tuning.GainAuto {
+				tuner.manualGain, tuner.gain = false, 0
+			}
+		}
+	}
+	if err := front.setLoopThrough(properties); err != nil {
+		return err
+	}
 	frequency, err := tuning.Number(properties, "FREQUENCY", true)
 	if err != nil {
 		return err
 	}
 	// Put the amplifier back where it was asked to be: the card interface's reset
 	// pulses the same GPIO line.
-	if err := front.hardware.setExternalAmplifier(front.index, front.hardware.amplifierOn[front.index]); err != nil {
+	if err := front.hardware.restoreExternalAmplifiers(front.index); err != nil {
 		return err
 	}
 	if front.index == terrestrial {
@@ -597,7 +644,7 @@ func (front *frontend) Tune(properties map[string]string) error {
 
 // GainLadder is what this tuner's gain can be set to.
 //
-// The older boards' terrestrial FC0012 has a twenty-four step ladder with
+// The FC0012 boards' terrestrial FC0012 has a twenty-four step ladder with
 // published figures, and their satellite side has nothing. The V2 has a
 // board-level amplifier on each input with no figures for what it is worth, so
 // it is a switch. Its other settings are not offered; px3.md sets out what each
@@ -615,9 +662,7 @@ func (front *frontend) GainLadder(string) tuning.GainLadder {
 	return tuning.NewGainLadder(fc0012.GainStepsDB()...)
 }
 
-// SetGain moves whichever of those this board has. Both come up at the top, so
-// the setting exists to turn one down for an aerial strong enough to overload
-// the front end.
+// SetGain moves the input amplifier to the requested ladder step.
 func (front *frontend) SetGain(step int) error {
 	if front.hardware.wired.externalAmplifier != nil {
 		return front.hardware.setExternalAmplifier(front.index, step > 0)
@@ -645,17 +690,55 @@ func (front *frontend) tuneTerrestrial(frequency uint64) error {
 	if frequency < 10_000_000 {
 		frequency *= 1000
 	}
-	demod := front.hardware.demodT
-	if err := demod.SetAGCT(false); err != nil {
+	return front.hardware.demodT.Tune(front.hardware.wired.tuners[terrestrial], func() error {
+		if tuner, ok := front.hardware.tunerT.(*fc0012Tuner); ok && tuner.w3 {
+			return tuner.acquire(front.hardware.demodT, uint32(frequency))
+		}
+		if err := front.hardware.tunerT.Tune(uint32(frequency)); err != nil {
+			return fmt.Errorf("tune the terrestrial tuner: %w", err)
+		}
+		return nil
+	}, func() error {
+		return front.hardware.configureDemods(front.hardware.control, front.hardware.wired.afterTune[terrestrial])
+	})
+}
+
+// steppedLoopThrough is a tuner whose loop-through output has four steps, 0
+// the strongest: the V2's NM120 and TDA20142.
+type steppedLoopThrough interface {
+	SetLoopThrough(step int) error
+}
+
+// switchedLoopThrough is a tuner whose loop-through output is only on or off:
+// the FC0012.
+type switchedLoopThrough interface {
+	SetLoopThrough(on bool) error
+}
+
+// setLoopThrough sets this tuner's own loop-through output. A four-step chip
+// takes the level as it is, and is left at the middle step when the channel
+// does not say. The FC0012 is driven only for a channel naming a level above
+// low, and is otherwise left off as it is initialized. A tuner without one
+// still tunes such a channel: one channel file serves every tuner.
+func (front *frontend) setLoopThrough(properties map[string]string) error {
+	level, set, err := tuning.ParseLoopThrough(properties)
+	if err != nil {
 		return err
 	}
-	if err := front.hardware.tunerT.Tune(uint32(frequency)); err != nil {
-		return fmt.Errorf("tune NM120: %w", err)
+	var tuner any = front.hardware.tunerS
+	if front.index == terrestrial {
+		tuner = front.hardware.tunerT
 	}
-	if err := demod.SetAGCT(true); err != nil {
-		return err
+	switch loop := tuner.(type) {
+	case steppedLoopThrough:
+		err = loop.SetLoopThrough(int(level))
+	case switchedLoopThrough:
+		err = loop.SetLoopThrough(set && level != tuning.LoopThroughLow)
 	}
-	return demod.WritePairs(front.hardware.wired.terrestrialTuned)
+	if err != nil {
+		return fmt.Errorf("set tuner %d's loop-through: %w", front.index, err)
+	}
+	return nil
 }
 
 // tuneSatellite moves the satellite tuner and picks the relative stream out of
@@ -671,23 +754,36 @@ func (front *frontend) tuneSatellite(frequency uint64, properties map[string]str
 	if err != nil {
 		return err
 	}
-	// The enclosure gates one supply for both satellite tuners, so there is no
-	// voltage to choose: a channel asking for none is honoured by not claiming it.
-	feed, err := tuning.SwitchedSupply(properties)
-	if err != nil {
-		return err
-	}
-	if err := front.wantLNB(feed); err != nil {
-		return err
+	if front.hardware.wired.noLNBControl {
+		// Nothing here switches the supply, so a channel saying anything of it is
+		// refused rather than tuned as if it had been honoured.
+		lnb, err := tuning.ParseLNB(properties)
+		if err != nil {
+			return err
+		}
+		if lnb != tuning.LNBUnset {
+			return fmt.Errorf("%w: the PX-S3U and PX-S3U2 have no LNB supply this program can switch; the PX-S3U2 feeds the dish whenever its AC adapter is connected", tuning.ErrNoLNBSwitch)
+		}
+	} else {
+		// The enclosure gates one supply for both satellite tuners, so there is no
+		// voltage to choose: a channel asking for none is honoured by not claiming it.
+		feed, err := tuning.SwitchedSupply(properties)
+		if err != nil {
+			return err
+		}
+		if err := front.wantLNB(feed); err != nil {
+			return err
+		}
 	}
 	demod := front.hardware.demodS
-	if err := demod.SetAGCS(false); err != nil {
-		return err
-	}
-	if err := front.hardware.tunerS.Tune(frequency); err != nil {
-		return fmt.Errorf("tune the satellite tuner: %w", err)
-	}
-	if err := demod.SetAGCS(true); err != nil {
+	if err := demod.Tune(front.hardware.wired.tuners[satellite], func() error {
+		if err := front.hardware.tunerS.Tune(frequency); err != nil {
+			return fmt.Errorf("tune the satellite tuner: %w", err)
+		}
+		return nil
+	}, func() error {
+		return front.hardware.configureDemods(front.hardware.control, front.hardware.wired.afterTune[satellite])
+	}); err != nil {
 		return err
 	}
 	return demod.SelectStreamS(streamID)
@@ -710,6 +806,18 @@ func (front *frontend) Status() (device.Status, error) {
 	if err != nil || !locked {
 		return device.Status{}, err
 	}
+	if front.index == terrestrial {
+		if tuner, ok := front.hardware.tunerT.(*fc0012Tuner); ok && tuner.w3 && !tuner.manualGain && !tuner.gainApplied {
+			changed, err := tuner.AdjustGain()
+			if err != nil {
+				return device.Status{}, err
+			}
+			tuner.gainApplied = true
+			if changed {
+				return device.Status{}, nil
+			}
+		}
+	}
 	status := device.Status{Locked: true, Names: device.LockNames}
 	var cnr float64
 	var measured bool
@@ -727,22 +835,18 @@ func (front *frontend) Status() (device.Status, error) {
 
 // StartStream switches the demodulator's TS pins on and opens this tuner's
 // endpoint.
-func (front *frontend) StartStream() error {
+func (front *frontend) StartStream() (err error) {
+	defer func() {
+		if err != nil {
+			_ = front.StopStream()
+		}
+	}()
 	if err := front.enableTSPins(true); err != nil {
 		return err
 	}
 	if err := front.hardware.prepareTSChip(front.index); err != nil {
 		trace.Printf("%s: %v", front.name(), err)
 		return err
-	}
-	if front.hardware.v2 {
-		// On every stream rather than once: the same bytes each time, so a stream
-		// already running is not disturbed, and nothing that resets the card
-		// interface in between can leave this one without it.
-		if err := front.hardware.writeStreamSetup(front.index); err != nil {
-			trace.Printf("%s: %v", front.name(), err)
-			return err
-		}
 	}
 	// The channel is reset with mode 1 on every tune -- bit 0 of the
 	// demodulator bring-up's answer, 0xe9 -- which sets bit 2 of the filter's
@@ -774,7 +878,6 @@ func (front *frontend) StartStream() error {
 		return err
 	}
 	if err := front.hardware.bridge.StartStream(front.index); err != nil {
-		_ = front.hardware.bridge.SetFilterRun(front.index, false)
 		trace.Printf("%s: start the stream on channel %d: %v", front.name(), front.index, err)
 		return err
 	}

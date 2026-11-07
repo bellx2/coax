@@ -12,6 +12,21 @@ import (
 // addresses it.
 const testDemod = 0x22
 
+func TestInitializationAndTuningOnlyAddressTheRFTuner(t *testing.T) {
+	bus := &fakeBus{identity: 0x00013100}
+	tuner := New(bus, testDemod)
+	if err := tuner.Initialize(); err != nil {
+		t.Fatal(err)
+	}
+	writes := bus.tunnelled()
+	if len(writes) == 0 || writes[len(writes)-1] != [2]uint16{loopThroughRegister, loopThroughBase | 3} {
+		t.Fatal("RF initialization did not complete")
+	}
+	if err := tuner.Tune(557143000); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // fakeBus records what the driver writes and answers the identity register.
 type fakeBus struct {
 	// identity is what the chip answers when its identity register is read.
@@ -26,11 +41,6 @@ func (bus *fakeBus) Write(address byte, data []byte) error {
 		return errors.New("a transfer went somewhere other than the demodulator")
 	}
 	if len(data) < 4 || data[0] != 0xfe || data[1] != 0xce {
-		if len(data) == 2 {
-			// A demodulator register, written directly rather than tunnelled.
-			bus.writes = append(bus.writes, append([]byte(nil), data...))
-			return nil
-		}
 		return errors.New("a tunnelled transfer was malformed")
 	}
 	bus.selected = uint16(data[2])<<8 | uint16(data[3])
@@ -152,5 +162,22 @@ func TestTheMasksAreNotInterchangeable(t *testing.T) {
 	// With the narrower mask the two would be indistinguishable.
 	if nm130v&0x000fff00 != nm130.id&0x000fff00 {
 		t.Error("this test is about the narrow mask confusing the two")
+	}
+}
+
+func TestLoopThroughStepsRunFromTheStrongest(t *testing.T) {
+	bus := &fakeBus{identity: 0x00013100}
+	tuner := New(bus, testDemod)
+	for step, code := range []uint16{3, 2, 1, 0} {
+		if err := tuner.SetLoopThrough(step); err != nil {
+			t.Fatal(err)
+		}
+		writes := bus.tunnelled()
+		if got := writes[len(writes)-1]; got != [2]uint16{loopThroughRegister, loopThroughBase | code} {
+			t.Fatalf("step %d wrote %#x", step, got)
+		}
+	}
+	if err := tuner.SetLoopThrough(4); err == nil {
+		t.Fatal("step 4 was taken")
 	}
 }

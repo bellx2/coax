@@ -39,7 +39,6 @@ var (
 //	kIOReturnTimeout            iokit_common_err(0x2d6), a transfer that expired
 //	kIOReturnNotAttached        iokit_common_err(0x2d9)
 //	kIOReturnAborted            iokit_common_err(0x2eb), a call cut short
-//	kIOReturnNotResponding      iokit_common_err(0x2ed)
 //	kIOUSBTransactionTimeout    iokit_usb_err(0x51), a timeout from the USB stack
 //
 // Check these against the headers, not off a nearby constant: the common ones are not in
@@ -53,10 +52,7 @@ const (
 	// kIOReturnAborted is what an IOKit call reports when a signal cut it short.
 	// Nothing here produces one any more (see callUninterrupted); it is named so
 	// an unforeseen one is recognisable.
-	kIOReturnAborted = 0xe00002eb
-	// kIOReturnNotResponding is what a handle answers once its device has dropped
-	// off the bus, even after the device has come back under a new address. libusb
-	// reads it as LIBUSB_ERROR_NO_DEVICE for the same reason.
+	kIOReturnAborted         = 0xe00002eb
 	kIOReturnNotResponding   = 0xe00002ed
 	kIOUSBTransactionTimeout = 0xe0004051
 )

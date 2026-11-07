@@ -48,6 +48,7 @@ HTTPで選局を要求する方法は[tuner-host.md](tuner-host.md)にありま�
 | `SAT_NUMBER` | DiSEqCスイッチのポート | `0`〜`3` | `dvb`、`bda` | 送らない |
 | `LNB` | アンテナのLNBfの種類 | 名前の一覧を参照 | すべて（周波数の換算）| - |
 | `GAIN`／`LNA` | フロントエンドの利得 | `auto`／`min`／`max`など | デバイスごと | `409 unsupported`（`gain`）|
+| `LOOP_THROUGH` | ループスルー出力 | `max`／`high`／`mid`／`low` | `px3` | 無視 |
 
 必須なのは`DELIVERY_SYSTEM`と`FREQUENCY`だけで、ほかは省略しても選局を行います。
 表の「無視」は、そのバックエンドでは指定しても使わないという意味です。
@@ -244,6 +245,7 @@ DiSEqCスイッチのポート番号で、`0`〜`3`の4つです。
 | `tbs5520se` | 13V | 18V | できない | ○（Si2183のDiSEqCコマンド経由）|
 | `chardev`、Windowsの`pt3`／`pt1` | 11V | 15V | できる | − |
 | `px4`、`pxmlt`、`isdb2056`、`px3` | 給電する | 給電する | できる | エラー |
+| `px3`のうちPX-S3U／S3U2 | エラー | エラー | エラー | エラー |
 
 PLEX系のUSBチューナー（`px4`／`pxmlt`／`isdb2056`／`px3`）は、GPIOで1系統の給電を入切するだけで段が無いので、`low`も`high`も「給電する」になります。
 給電はデバイスの全チューナーで共有なので、`off`は「そのチューナーとしては給電を要求しない」という意味になります。
@@ -367,6 +369,30 @@ libdvbv5と同じファイルを使えるようにするためです。
 `px4`／`isdb2056`の地上側（R850）には設定がありません。
 LNA、RF、ミキサーの利得はどれも周波数帯ごとに決まったテーブルから選ばれ、外部から変更する方法がありません。
 
+## `LOOP_THROUGH`
+
+`LOOP_THROUGH`は、チューナー自身のループスルー出力の強さです。
+ループスルーは、チューナーが受けたアンテナの信号を、同一ハード内の別のチューナーへ分けて送る仕組みです。
+設定するのは送る側のチューナーの出力で、そのチューナー自身の受信は変わりません。
+`GAIN`とは別の設定です。
+
+| 値 | 意味 |
+| --- | --- |
+| `max` | 最大 |
+| `high` | 高 |
+| `mid` | 中 |
+| `low` | 低 |
+
+| バックエンド | 段 | 省略したとき |
+| --- | --- | --- |
+| `px3`のうちPX-W3U3 V2（NM120、TDA20142）| 4段 | 最大 |
+| `px3`のうちPX-S3U／S3U2／W3U2／W3U3の地上側（FC0012）| 入切のみ。`low`は切、それ以外は入 | 切 |
+| 上記以外 | - | 無視します |
+
+設定を持たないチューナーに指定しても、エラーにはせずに選局します。
+同じチャンネル定義ファイルをどのチューナーでも使えるようにするためです。
+どのチューナーに設定があるかは`/tuners`の`controls`に出ます（[tuner-host.md](tuner-host.md#tunersid)）。
+
 ## libdvbv5との違い
 
 `LNB`を指定すればダウンリンク周波数のファイルも使えますが、`LNB`が無いときの解釈はlibdvbv5と逆です。
@@ -411,7 +437,7 @@ LNA、RF、ミキサーの利得はどれも周波数帯ごとに決まったテ
 | [`pt3`／`pt1`](../boards/earthsoft-windows.md)（Windows）| ISDB-T、ISDB-S | `FREQUENCY`は周波数のまま指定。`STREAM_ID`はTSIDも12未満の相対スロットも可（省略時は相対スロット0）|
 | [`dd`](../boards/dd.md)（Windows PCIe）| ボードごと | 伝送方式に応じて。衛星は`SYMBOL_RATE` |
 | [`tbs`](../boards/tbs.md)（Windows PCIe）| ISDB-T、ISDB-S、ISDB-S3、DVB-T、DVB-T2、DVB-C、DVB-S、DVB-S2、J.83 Annex B | `FREQUENCY`。衛星は`SYMBOL_RATE`必須。デバイスにより対応方式は異なります |
-| [`dvb`](../boards/dvb.md)（Linux DVB）| Linux DVB APIで表現できるもの全般（ISDB-S3を除く）| 伝送方式に応じて |
+| [`dvb`](../boards/dvb.md)（Linux DVB）| Linux DVB APIで表現できるもの全般（ISDB-S3を除く）| 伝送方式に応じて。ISDB-Sの相対TS番号はドライバーによって使えません（[dvb.md](../boards/dvb.md#isdb-sのstream_id)）|
 | [`bda`](../boards/bda.md)（Windows）| Windows BDAが対応するもの | 伝送方式に応じて |
 
 `coax list --tuners`を使うと、チューナーごとに受信できる伝送方式が表示されます。

@@ -31,6 +31,7 @@ func (c cardSource) Boards() ([]usbcard.Attached, error) {
 			ID:       one.detected.USB,
 			Serial:   one.detected.Serial,
 			Port:     one.detected.Port,
+			CardSlot: one.detected.CardSlot,
 		})
 	}
 	return boards, nil
@@ -65,7 +66,7 @@ func (c cardSource) Open(backend, selector string) (usbcard.Borrow, error) {
 			return usbcard.Borrow{}, ErrGone
 		}
 		return usbcard.Borrow{
-			Board: failingCard{Board: opened, reader: hold.Reader(), board: held},
+			Board: failingCard{Board: opened, hold: hold},
 			Identity: usbcard.Identity{
 				Serial:     one.detected.Serial,
 				Port:       one.detected.Port,
@@ -80,28 +81,31 @@ func (c cardSource) Open(backend, selector string) (usbcard.Borrow, error) {
 	return usbcard.Borrow{}, ErrUnknownTuner
 }
 
-// failingCard hands the card's failures to the board, as a tuner's are. A board
-// that dropped off the bus and came back in the same socket keeps its key, so
-// the listing never says it went; a card session holding it would otherwise
-// talk to the dead handle for as long as the daemon runs. Marked gone, the
-// board is reopened on the next borrow.
+// The hold belongs to one board generation. Never probe its reader again after
+// a failure has retired that generation and closed the underlying device.
 type failingCard struct {
 	device.Board
-	reader device.CardReader
-	board  *board
+	hold *CardHold
 }
 
 func (c failingCard) CardStatus() (device.CardStatus, error) {
-	status, err := c.reader.CardStatus()
-	return status, c.board.fail(err)
+	if c.hold.Stale() {
+		return device.CardStatus{}, ErrGone
+	}
+	status, err := c.hold.Reader().CardStatus()
+	return status, c.hold.board.fail(err)
 }
-
 func (c failingCard) ResetCard() ([]byte, error) {
-	atr, err := c.reader.ResetCard()
-	return atr, c.board.fail(err)
+	if c.hold.Stale() {
+		return nil, ErrGone
+	}
+	atr, err := c.hold.Reader().ResetCard()
+	return atr, c.hold.board.fail(err)
 }
-
 func (c failingCard) TransmitAPDU(apdu []byte) ([]byte, error) {
-	response, err := c.reader.TransmitAPDU(apdu)
-	return response, c.board.fail(err)
+	if c.hold.Stale() {
+		return nil, ErrGone
+	}
+	response, err := c.hold.Reader().TransmitAPDU(apdu)
+	return response, c.hold.board.fail(err)
 }

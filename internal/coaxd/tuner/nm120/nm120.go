@@ -30,10 +30,6 @@ type Tuner struct {
 // the demodulator core the tuner sits behind.
 func New(bus i2c.Bus, address byte) *Tuner { return &Tuner{bus: bus, address: address} }
 
-func (tuner *Tuner) write8(register, value byte) error {
-	return tuner.bus.Write(tuner.address, []byte{register, value})
-}
-
 func (tuner *Tuner) write(register uint16, value uint32, size int) error {
 	if size < 0 || size > 4 {
 		return fmt.Errorf("NM120 write size %d is invalid", size)
@@ -76,14 +72,9 @@ func (tuner *Tuner) read32(register uint16) (uint32, error) {
 	return binary.LittleEndian.Uint32(data), nil
 }
 
-// Initialize loads the NM120 RF and baseband defaults.
+// Initialize loads the NM120 RF and baseband defaults. The board must prepare
+// the TC90522 demodulator and its I2C repeater before calling this method.
 func (tuner *Tuner) Initialize() error {
-	initial := [][2]byte{{0xb0, 0xa0}, {0xb2, 0x3d}, {0xb3, 0x25}, {0xb4, 0x8b}, {0xb5, 0x4b}, {0xb6, 0x3f}, {0xb7, 0xff}, {0xb8, 0xc0}, {0x03, 0}, {0x1d, 0}, {0x1f, 0}, {0x0e, 0x77}, {0x0f, 0x13}, {0x75, 0x02}}
-	for _, pair := range initial {
-		if err := tuner.write8(pair[0], pair[1]); err != nil {
-			return err
-		}
-	}
 	rf := [][2]byte{{6, 72}, {7, 64}, {10, 235}, {11, 17}, {12, 16}, {13, 136}, {16, 4}, {17, 48}, {18, 48}, {21, 170}, {22, 3}, {23, 128}, {24, 103}, {25, 212}, {26, 68}, {28, 16}, {29, 238}, {30, 153}, {33, 197}, {34, 145}, {36, 1}, {43, 145}, {45, 1}, {47, 128}, {49, 0}, {51, 0}, {56, 0}, {57, 47}, {58, 0}, {59, 0}}
 	for _, pair := range rf {
 		if err := tuner.write(uint16(pair[0]), uint32(pair[1]), 1); err != nil {
@@ -97,9 +88,7 @@ func (tuner *Tuner) Initialize() error {
 	if err := tuner.write(0x36, uint32(value&0x7f), 1); err != nil {
 		return err
 	}
-	// The two thirty-two-bit writes. The registers are 0x0164 and 0x01c0, not
-	// 0x28 and 0x800 as a misreading of where the pairs begin suggests, and the
-	// second value really is as arbitrary as it looks.
+	// Apply the two 32-bit RF defaults.
 	for _, item := range []struct {
 		register uint16
 		value    uint32
@@ -111,18 +100,28 @@ func (tuner *Tuner) Initialize() error {
 	if err := tuner.finish(); err != nil {
 		return err
 	}
-	// The loop-through gain, which the initialization table leaves at 0xeb: 0xf8
-	// with the gain's code in the low two bits, 3 being the maximum. It is the
-	// level handed to whatever is chained on the aerial lead after this board,
-	// not this tuner's own gain, so it is not offered as a setting.
-	return tuner.write(loopThroughRegister, loopThroughMaximum, 1)
+	// The loop-through gain, which the initialization table leaves at 0xeb, is
+	// the level handed to the tuner fed from this one, not this tuner's own.
+	return tuner.SetLoopThrough(defaultLoopThrough)
 }
 
-// The loop-through gain register and the value it is left at.
+// The loop-through gain register: 0xf8 with the gain's code in the low two
+// bits, 3 the strongest and 0 the weakest.
 const (
 	loopThroughRegister = 0x0a
-	loopThroughMaximum  = 0xf8 | 3
+	loopThroughBase     = 0xf8
+	// defaultLoopThrough is the step Initialize leaves, the strongest.
+	defaultLoopThrough = 0
 )
+
+// SetLoopThrough sets the loop-through gain, step 0 the strongest and 3 the
+// weakest.
+func (tuner *Tuner) SetLoopThrough(step int) error {
+	if step < 0 || step > 3 {
+		return fmt.Errorf("NM120 loop-through step %d is outside 0..3", step)
+	}
+	return tuner.write(loopThroughRegister, uint32(loopThroughBase|(3-step)), 1)
+}
 
 // The four parts this driver recognises, and what their chip identity reads as.
 // The masks are not all the same width, so each part carries its own.
@@ -194,11 +193,6 @@ func (tuner *Tuner) Tune(frequency uint32) error {
 	}{{45000000, 167, 58}, {55000000, 151, 57}, {65000000, 100, 54}, {75000000, 83, 53}, {85000000, 82, 53}, {95000000, 65, 52}, {105000000, 64, 52}, {115000000, 64, 52}, {125000000, 0, 0}}
 	v45 := []uint32{0, 1, 2, 3, 4, 6, 9, 12}
 	loTable := []uint32{0, 0, 434000000, 237000000, 214000000, 118000000, 79000000, 53000000}
-	for _, pair := range [][2]byte{{1, 0x50}, {0x47, 0x30}, {0x25, 0}, {0x20, 0}, {0x23, 0x4d}} {
-		if err := tuner.write8(pair[0], pair[1]); err != nil {
-			return err
-		}
-	}
 	clockFrequency := frequency
 	var loFrequency, v14, integer, fraction uint32
 	var band byte
@@ -352,11 +346,6 @@ func (tuner *Tuner) Tune(frequency uint32) error {
 			return err
 		}
 		if err = tuner.write(0x104, v|0x20, 4); err != nil {
-			return err
-		}
-	}
-	for _, pair := range [][2]byte{{0x23, 0x4c}, {1, 0x50}, {0x71, 1}, {0x72, 0x24}} {
-		if err := tuner.write8(pair[0], pair[1]); err != nil {
 			return err
 		}
 	}

@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -63,6 +65,9 @@ type Attached struct {
 	ID       usbio.ID
 	Serial   string
 	Port     string
+	// CardSlot marks a board of a backend in cardSlotBackends as one with a
+	// slot.
+	CardSlot bool
 }
 
 // Identity is what tells one attached board from another across a replug.
@@ -138,6 +143,13 @@ var slotBackends = map[string]slotNaming{
 	"fsusb2i":   {"KEIAN", "KTV-FSMINI"},
 	"us3pout":   {"DigiBest", "US-3POUT"},
 	"cech-zd1j": {"Sony", "CECH-ZD1 J"},
+}
+
+// cardSlotBackends are the backends whose boards carry a slot only when the
+// source says so: a PLEX enclosure on its BDA driver is listed tuner by tuner,
+// and one of them is the way to its slot.
+var cardSlotBackends = map[string]slotNaming{
+	"bda": {"PLEX", "PX-S3U series"},
 }
 
 // slotNaming is the vendor and model a reader is named after.
@@ -221,8 +233,8 @@ func (p *Provider) devices() ([]cardDevice, error) {
 	}
 	var found []cardDevice
 	for _, candidate := range attached {
-		naming, ok := slotBackends[candidate.Backend]
-		if !ok {
+		naming, ok := readerNaming(candidate)
+		if !ok || sharesSlot(candidate, attached) {
 			continue
 		}
 		found = append(found, cardDevice{
@@ -237,6 +249,91 @@ func (p *Provider) devices() ([]cardDevice, error) {
 	}
 	p.observe(found)
 	return found, nil
+}
+
+// readerNaming applies the same eligibility check to the selected reader and
+// to every alias considered during deduplication.
+func readerNaming(one Attached) (slotNaming, bool) {
+	if flagged, known := cardSlotBackends[one.Backend]; known {
+		return flagged, one.CardSlot
+	}
+	naming, ok := slotBackends[one.Backend]
+	return naming, ok
+}
+
+// bdaReaderGroup resolves Windows device topology without opening filters.
+// Other platforms do not enumerate BDA devices; tests can supply a topology.
+var bdaReaderGroup func(string) string
+
+// readerGroup names the physical slot shared by several device paths. RF
+// control routing is independent: the original W3U2/W3U3 have two RF control
+// bridges, but their enclosure still has one card slot.
+func readerGroup(one Attached) string {
+	switch one.Backend {
+	case "px3":
+		if one.ID.Vendor != 0x0b06 {
+			return ""
+		}
+		switch one.ID.Product {
+		case 4, 5, 6:
+		default:
+			return ""
+		}
+		if hub, ok := parentPort(one.Port); ok {
+			return fmt.Sprintf("px3:%04x:%s", one.ID.Product, hub)
+		}
+	case "bda":
+		if one.CardSlot && bdaReaderGroup != nil {
+			if group := bdaReaderGroup(one.Selector); group != "" {
+				return "bda:" + group
+			}
+		}
+	}
+	return ""
+}
+
+// sharesSlot reports whether another eligible path represents this physical
+// reader already. Choose deterministically so enumeration order cannot change
+// the reader selected for a still-attached enclosure.
+func sharesSlot(one Attached, attached []Attached) bool {
+	group := readerGroup(one)
+	if group == "" {
+		return false
+	}
+	for _, other := range attached {
+		if other.Backend != one.Backend || other.Selector == one.Selector {
+			continue
+		}
+		if _, ok := readerNaming(other); !ok || readerGroup(other) != group {
+			continue
+		}
+		if one.Backend == "px3" {
+			if portBefore(other.Port, one.Port) {
+				return true
+			}
+		} else if strings.ToLower(other.Selector) < strings.ToLower(one.Selector) {
+			return true
+		}
+	}
+	return false
+}
+
+// parentPort is the hub port a device's port hangs off.
+func parentPort(port string) (string, bool) {
+	at := strings.LastIndexByte(port, '.')
+	if at < 0 {
+		return "", false
+	}
+	return port[:at], true
+}
+
+// portBefore orders two ports of one hub by their last number.
+func portBefore(a, b string) bool {
+	last := func(port string) int {
+		n, _ := strconv.Atoi(port[strings.LastIndexByte(port, '.')+1:])
+		return n
+	}
+	return last(a) < last(b)
 }
 
 // boardIdentity is the token in a reader's published name that tells one
@@ -309,7 +406,19 @@ func (p *Provider) slotFor(one cardDevice) *slot {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 	if existing, ok := p.slots[one.name]; ok {
-		return existing
+		existing.state.Lock()
+		stale := existing.retired || existing.board != nil && existing.staleLocked()
+		if !stale && existing.cardDevice.selector == one.selector {
+			existing.state.Unlock()
+			return existing
+		}
+		existing.retired = true
+		events := existing.events + 1
+		existing.state.Unlock()
+		created := newSlot(p, one)
+		created.events = events
+		p.slots[one.name] = created
+		return created
 	}
 	created := newSlot(p, one)
 	p.slots[one.name] = created

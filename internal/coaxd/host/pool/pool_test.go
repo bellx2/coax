@@ -62,11 +62,13 @@ type fakeBoard struct {
 	tuners []device.TunerInfo
 	card   bool
 
-	mutex   sync.Mutex
-	opened  counter
-	closed  counter
-	taken   map[int]bool
-	tuneErr error
+	mutex     sync.Mutex
+	opened    counter
+	closed    counter
+	taken     map[int]bool
+	tuneErr   error
+	cardErr   error
+	cardCalls int
 	// deadOpens makes the card on every handle opened so far answer ErrGone, as
 	// a handle does once its device has dropped off the bus and come back.
 	deadOpens int
@@ -191,17 +193,20 @@ func (b *fakeBoard) killHandles() {
 	b.deadOpens = b.opened.Get()
 }
 
-func (b cardBoard) CardStatus() (device.CardStatus, error) {
+func (b cardBoard) cardFailure() error {
 	b.mutex.Lock()
-	dead := b.open <= b.deadOpens
-	b.mutex.Unlock()
-	if dead {
-		return device.CardStatus{}, usbio.ErrGone
+	defer b.mutex.Unlock()
+	b.cardCalls++
+	if b.open <= b.deadOpens {
+		return usbio.ErrGone
 	}
-	return device.CardStatus{Present: true, Reader: "fake"}, nil
+	return b.cardErr
 }
-func (b cardBoard) ResetCard() ([]byte, error)          { return []byte{0x3b}, nil }
-func (b cardBoard) TransmitAPDU([]byte) ([]byte, error) { return []byte{0x90, 0x00}, nil }
+func (b cardBoard) CardStatus() (device.CardStatus, error) {
+	return device.CardStatus{Present: true, Reader: "fake"}, b.cardFailure()
+}
+func (b cardBoard) ResetCard() ([]byte, error)          { return []byte{0x3b}, b.cardFailure() }
+func (b cardBoard) TransmitAPDU([]byte) ([]byte, error) { return []byte{0x90, 0x00}, b.cardFailure() }
 
 // px4Board is the shape this pool exists for: four tuners and a card slot on one
 // USB device.

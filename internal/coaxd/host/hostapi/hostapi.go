@@ -36,6 +36,9 @@ type Board struct {
 	Location string `json:"location"`
 	Serial   string `json:"serial,omitempty"`
 	Port     string `json:"port,omitempty"`
+	// Enclosure is the same for every board of one enclosure -- the two bridges of
+	// a PX-W3U3 -- and absent for a board that stands alone.
+	Enclosure string `json:"enclosure,omitempty"`
 
 	// Deliveries is every delivery system some tuner of this board reaches.
 	Deliveries []string `json:"deliveries,omitempty"`
@@ -153,6 +156,16 @@ type Controls struct {
 	LNB *LNBControl `json:"lnb,omitempty"`
 	// Gain is present where gain is honoured.
 	Gain *GainControl `json:"gain,omitempty"`
+	// LoopThrough is present where loop_through is honoured.
+	LoopThrough *LoopThroughControl `json:"loop_through,omitempty"`
+}
+
+// LoopThroughControl is what loop_through can ask of this tuner: the level of
+// its own loop-through output, handed on to the tuner fed from it.
+type LoopThroughControl struct {
+	// Kind is "switch" for an output that is on or off (max on, low off) and
+	// "steps" for one with the four levels max, high, mid and low.
+	Kind string `json:"kind"`
 }
 
 // LNBControl is what lnb_power can ask of this tuner.

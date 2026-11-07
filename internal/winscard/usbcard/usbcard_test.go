@@ -6,6 +6,7 @@ package usbcard
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -180,6 +181,35 @@ func TestABoardWithoutASerialKeepsItsNameBesideAnotherOfItsModel(t *testing.T) {
 		if one.port == "1-2" && one.name != before[0].name {
 			t.Errorf("the board in 1-2 was %q alone and %q beside another", before[0].name, one.name)
 		}
+	}
+}
+
+// Each dual-bridge PX3 enclosure has one physical card slot. Independent RF
+// control bridges do not imply independent readers.
+func TestDualBridgeEnclosuresAreOneReader(t *testing.T) {
+	v2 := usbio.ID{Vendor: 0x0b06, Product: 0x0006}
+	w3u3 := usbio.ID{Vendor: 0x0b06, Product: 0x0005}
+	stub(t, nil, []usb.Detected{
+		{Backend: "px3", Device: "1:9", ID: v2, Port: "1-1.2"},
+		{Backend: "px3", Device: "1:8", ID: v2, Port: "1-1.1"},
+		{Backend: "px3", Device: "1:20", ID: v2, Port: "1-4.1"},
+		{Backend: "px3", Device: "1:30", ID: w3u3, Port: "1-3.1"},
+		{Backend: "px3", Device: "1:31", ID: w3u3, Port: "1-3.2"},
+		{Backend: "px3", Device: "1:40", ID: usbio.ID{Vendor: 0x0b06, Product: 4}, Port: "1-5.2"},
+		{Backend: "px3", Device: "1:41", ID: usbio.ID{Vendor: 0x0b06, Product: 4}, Port: "1-5.1"},
+		{Backend: "px3", Device: "1:50", ID: usbio.ID{Vendor: 0x0b06, Product: 3}, Port: "1-6.1"},
+		{Backend: "px3", Device: "1:51", ID: usbio.ID{Vendor: 0x0b06, Product: 3}, Port: "1-6.2"},
+	})
+	found, err := New(Config{}).devices()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ports []string
+	for _, one := range found {
+		ports = append(ports, one.port)
+	}
+	if want := []string{"1-1.1", "1-4.1", "1-3.1", "1-5.1", "1-6.1", "1-6.2"}; !slices.Equal(ports, want) {
+		t.Errorf("readers on %v, want %v", ports, want)
 	}
 }
 
@@ -446,4 +476,91 @@ func TestGetStatusChangeIsCancellable(t *testing.T) {
 // variables for provider contexts do not shadow the package.
 func context2() (context.Context, context.CancelFunc) {
 	return context.WithCancel(context.Background())
+}
+
+// listedSource lists boards and opens none.
+type listedSource []Attached
+
+func (l listedSource) Boards() ([]Attached, error) { return l, nil }
+func (l listedSource) Open(string, string) (Borrow, error) {
+	return Borrow{}, errors.New("not opened in this test")
+}
+
+func TestABDATunerIsAReaderOnlyWhenMarked(t *testing.T) {
+	provider := New(Config{Boards: listedSource{
+		{Backend: "bda", Selector: `@device:pnp:\\?\usb#vid_0b06&pid_0006&mi_00#a&1#{c}\{t0}`, CardSlot: true},
+		{Backend: "bda", Selector: `@device:pnp:\\?\usb#vid_0b06&pid_0006&mi_00#a&1#{c}\{t1}`},
+		{Backend: "bda", Selector: `@device:pnp:\\?\pci#ven_0000&dev_0000#1#{c}\{x}`},
+	}})
+	found, err := provider.devices()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(found) != 1 || !strings.HasSuffix(found[0].selector, `\{t0}`) || !strings.HasPrefix(found[0].name, "PLEX ") {
+		t.Fatalf("listed %+v, want the marked tuner alone", found)
+	}
+}
+
+func TestBDACardAliasesShareOneReaderPerEnclosure(t *testing.T) {
+	previous := bdaReaderGroup
+	t.Cleanup(func() { bdaReaderGroup = previous })
+	groups := map[string]string{
+		"usb-w3u2-box-a-bridge-2":      "w3u2:box-a",
+		"usb-w3u2-box-a-bridge-1":      "w3u2:box-a",
+		"usb-w3u2-box-b-bridge-1":      "w3u2:box-b",
+		"usb-w3u3-box-a-bridge-2":      "w3u3:box-a",
+		"usb-w3u3-box-a-bridge-1":      "w3u3:box-a",
+		"usb-w3u3-box-a-0-terrestrial": "w3u3:box-a",
+	}
+	bdaReaderGroup = func(selector string) string { return groups[selector] }
+	source := listedSource{
+		{Backend: "bda", Selector: "usb-w3u2-box-a-bridge-2", CardSlot: true},
+		{Backend: "bda", Selector: "usb-w3u2-box-a-bridge-1", CardSlot: true},
+		{Backend: "bda", Selector: "usb-w3u2-box-b-bridge-1", CardSlot: true},
+		{Backend: "bda", Selector: "usb-w3u3-box-a-bridge-2", CardSlot: true},
+		{Backend: "bda", Selector: "usb-w3u3-box-a-bridge-1", CardSlot: true},
+		// An ineligible filter cannot hide a marked card owner, even when its
+		// selector sorts before every eligible alias.
+		{Backend: "bda", Selector: "usb-w3u3-box-a-0-terrestrial"},
+		{Backend: "bda", Selector: "pci-card-a-tuner-0", CardSlot: true},
+		{Backend: "bda", Selector: "pci-card-b-tuner-0", CardSlot: true},
+	}
+	before, err := New(Config{Boards: source}).devices()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"usb-w3u2-box-a-bridge-1", "usb-w3u2-box-b-bridge-1", "usb-w3u3-box-a-bridge-1", "pci-card-a-tuner-0", "pci-card-b-tuner-0"}
+	if len(before) != len(want) {
+		t.Fatalf("listed %+v", before)
+	}
+	names := map[string]string{}
+	for i, one := range before {
+		if one.selector != want[i] {
+			t.Fatalf("reader %d: %s, want %s", i, one.selector, want[i])
+		}
+		names[one.selector] = one.name
+	}
+	slices.Reverse(source)
+	after, err := New(Config{Boards: source}).devices()
+	if err != nil || len(after) != len(before) {
+		t.Fatalf("after reorder: %+v, %v", after, err)
+	}
+	for _, one := range after {
+		if names[one.selector] != one.name {
+			t.Fatalf("reader changed with enumeration order: %+v", one)
+		}
+	}
+}
+
+func TestUnknownBDAReaderTopologyDoesNotMergeDevices(t *testing.T) {
+	previous := bdaReaderGroup
+	t.Cleanup(func() { bdaReaderGroup = previous })
+	bdaReaderGroup = func(string) string { return "" }
+	found, err := New(Config{Boards: listedSource{
+		{Backend: "bda", Selector: "usb-card-a", CardSlot: true},
+		{Backend: "bda", Selector: "usb-card-b", CardSlot: true},
+	}}).devices()
+	if err != nil || len(found) != 2 {
+		t.Fatalf("unresolved devices merged: %+v, %v", found, err)
+	}
 }
