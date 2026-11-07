@@ -18,6 +18,7 @@ import (
 	"github.com/Till0196/coax/pkg/exporter"
 	"github.com/Till0196/coax/pkg/host"
 	scanprogress "github.com/Till0196/coax/pkg/progress"
+	"github.com/Till0196/coax/pkg/report"
 	"github.com/Till0196/coax/pkg/scanner"
 )
 
@@ -41,6 +42,7 @@ type scanOptions struct {
 	restart      bool
 	keepProgress bool
 	progress     string
+	tuneCommand  string
 }
 
 func runScan(arguments []string, stdout io.Writer, stderr io.Writer) error {
@@ -66,6 +68,8 @@ func runScan(arguments []string, stdout io.Writer, stderr io.Writer) error {
 	flags.BoolVar(&options.restart, "restart", false, "discard saved progress before scanning")
 	flags.BoolVar(&options.keepProgress, "keep-progress", false, "keep the progress file after a completed scan")
 	flags.StringVar(&options.progress, "progress", "", "progress file path")
+	flags.StringVar(&options.tuneCommand, "tune-command", "",
+		"tune each channel by running this command instead of a tuner the daemon has, for one coax does not drive: it is started per channel with {ch} replaced by the terrestrial channel number (13 to 62) and must write the transport stream to stdout until it is stopped with SIGTERM; nothing tells its lock, so a channel that sends nothing within --data-timeout is taken as not received. Quote words holding spaces with ' or \"")
 	// The same channel a `coax tune` command line describes, so that one channel
 	// can be scanned without writing a file for it.
 	system := flags.String("system", "", "delivery system of a channel named here, as a channel file spells it: ISDBT, ISDBS, DVBT2, ...")
@@ -160,27 +164,6 @@ func runScan(arguments []string, stdout io.Writer, stderr io.Writer) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	client, err := command.dial(ctx)
-	if err != nil {
-		return err
-	}
-	tuneOptions := host.TuneOptions{
-		Tuner:       options.tunerID,
-		LockTimeout: options.lockTimeout,
-		Settle:      settleTime,
-		// The scan does its own waiting, so that the line it is showing counts
-		// up while the demodulator makes up its mind and the signal it reads
-		// appears on it.
-		NoLockWait: true,
-		Priority:   options.priority,
-	}
-	// Every tuner the daemon lists, unless one was named. A satellite tuner
-	// cannot scan a cable band, and a host often carries both.
-	tuners, err := scanTuners(ctx, client, options.tunerID)
-	if err != nil {
-		return err
-	}
-
 	// A named channel carries the supply in its own properties; a walk or a file
 	// has it put on every satellite channel that does not say.
 	var satelliteVoltage string
@@ -205,29 +188,12 @@ func runScan(arguments []string, stdout io.Writer, stderr io.Writer) error {
 		Previous:         progressState.Results,
 		OnResult:         progressState.Record,
 	}
-	if options.discover.enabled {
-		// Discovery needs the tuners, so it happens here rather than where a
-		// channel file would have been read.
-		found, discoverErr := discoverAcross(ctx, client, tuneOptions, tuners, scanConfig, stderr, options.discover.systems)
-		if discoverErr != nil {
-			return discoverErr
-		}
-		entries, err = options.filterEntries(found)
-		if err != nil {
-			return err
-		}
-		markRoute(entries, options.route)
-		if len(entries) == 0 {
-			return fmt.Errorf("no channel candidates matched")
-		}
-		if options.listOnly {
-			return writeEntries(options.outputOrStdout(), stdout, entries)
-		}
+	scan := scanWithDaemon
+	if options.tuneCommand != "" {
+		scan = scanWithCommand
 	}
-
-	runs := planRuns(client, tuneOptions, tuners, entries)
-	report, err := scanAcross(ctx, client, tuneOptions, runs, scanConfig, stderr)
-	if err != nil {
+	report, done, err := scan(ctx, command, options, entries, scanConfig, stdout, stderr)
+	if err != nil || done {
 		return err
 	}
 
@@ -262,6 +228,85 @@ func runScan(arguments []string, stdout io.Writer, stderr io.Writer) error {
 	return nil
 }
 
+// scanWithDaemon は coaxd のチューナーでスキャンする。done は、結果を書くまでもなく終えたこと（--list）
+func scanWithDaemon(ctx context.Context, command *command, options scanOptions, entries []channelconfig.Entry,
+	scanConfig scanner.Options, stdout, stderr io.Writer) (report.Report, bool, error) {
+	client, err := command.dial(ctx)
+	if err != nil {
+		return report.Report{}, false, err
+	}
+	tuneOptions := host.TuneOptions{
+		Tuner:       options.tunerID,
+		LockTimeout: options.lockTimeout,
+		Settle:      settleTime,
+		// The scan does its own waiting, so that the line it is showing counts
+		// up while the demodulator makes up its mind and the signal it reads
+		// appears on it.
+		NoLockWait: true,
+		Priority:   options.priority,
+	}
+	// Every tuner the daemon lists, unless one was named. A satellite tuner
+	// cannot scan a cable band, and a host often carries both.
+	tuners, err := scanTuners(ctx, client, options.tunerID)
+	if err != nil {
+		return report.Report{}, false, err
+	}
+
+	if options.discover.enabled {
+		// Discovery needs the tuners, so it happens here rather than where a
+		// channel file would have been read.
+		found, discoverErr := discoverAcross(ctx, client, tuneOptions, tuners, scanConfig, stderr, options.discover.systems)
+		if discoverErr != nil {
+			return report.Report{}, false, discoverErr
+		}
+		entries, err = options.filterEntries(found)
+		if err != nil {
+			return report.Report{}, false, err
+		}
+		markRoute(entries, options.route)
+		if len(entries) == 0 {
+			return report.Report{}, false, fmt.Errorf("no channel candidates matched")
+		}
+		if options.listOnly {
+			return report.Report{}, true, writeEntries(options.outputOrStdout(), stdout, entries)
+		}
+	}
+
+	runs := planRuns(client, tuneOptions, tuners, entries)
+	scanned, err := scanAcross(ctx, client, tuneOptions, runs, scanConfig, stderr)
+	return scanned, false, err
+
+}
+
+// scanWithCommand は --tune-command の外部コマンドでチャンネルごとに選局してスキャンする。coaxd には接続しない
+func scanWithCommand(ctx context.Context, _ *command, options scanOptions, entries []channelconfig.Entry,
+	scanConfig scanner.Options, stdout, stderr io.Writer) (report.Report, bool, error) {
+	device, err := newCommandTuner(options.tuneCommand)
+	if err != nil {
+		return report.Report{}, false, err
+	}
+	scanConfig.Device = device
+	if options.discover.enabled {
+		found, err := scanner.Discover(ctx, scanConfig, stderr, options.discover.systems)
+		if err != nil {
+			return report.Report{}, false, err
+		}
+		if entries, err = options.filterEntries(found); err != nil {
+			return report.Report{}, false, err
+		}
+		markRoute(entries, options.route)
+		if len(entries) == 0 {
+			return report.Report{}, false, fmt.Errorf("no channel candidates matched")
+		}
+		if options.listOnly {
+			return report.Report{}, true, writeEntries(options.outputOrStdout(), stdout, entries)
+		}
+	}
+	// Scan は渡したデバイスを閉じる
+	scanned, err := scanner.Scan(ctx, entries, scanConfig, stderr)
+	return scanned, false, err
+}
+
 func (options scanOptions) validate() error {
 	if options.lockTimeout <= 0 || options.dataTimeout <= 0 || options.pollInterval <= 0 {
 		return fmt.Errorf("timeouts and poll interval must be positive")
@@ -274,6 +319,9 @@ func (options scanOptions) validate() error {
 	}
 	if options.maximumBytes < options.minimumBytes {
 		return fmt.Errorf("max-bytes must be greater than or equal to min-bytes")
+	}
+	if options.tuneCommand != "" && options.tunerID != "" {
+		return fmt.Errorf("--tune-command tunes with its own command, so it does not take --tuner")
 	}
 	if route := strings.ToUpper(strings.TrimSpace(options.route)); route != "" && !channelconfig.ValidRoute(route) {
 		return fmt.Errorf("invalid route %q; it is one of TER, SAT, CATV or HIKARI", options.route)
