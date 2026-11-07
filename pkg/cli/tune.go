@@ -20,7 +20,7 @@ import (
 // end runs, one process per tuner: it tunes, copies bytes, and stops when it is
 // stopped. Stopping is all that ends a recording -- the tuner belongs to this
 // connection, and closing it gives the tuner back.
-func runTune(arguments []string, stdout, stderr io.Writer) error {
+func runTune(arguments []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	command := newHardwareCommand("tune", stderr)
 	flags := command.flags
 
@@ -46,11 +46,16 @@ func runTune(arguments []string, stdout, stderr io.Writer) error {
 		"write the signal and what the daemon sees in the stream to stderr once a second: lock, CNR, bitrate, errors and drops")
 	program := flags.Bool("program", false,
 		"write the programme on now and next to stderr whenever either changes, as the stream's event information table gives them")
+	input := flags.String("input", "",
+		"read a stream already received from this file, or - for stdin, instead of tuning; --program and --stats then read it, and nothing reaches the daemon")
 	alias(flags, "o", "output")
 	alias(flags, "t", "tuner")
 	alias(flags, "f", "freq")
 	if err := command.parseOnly(arguments); err != nil {
 		return err
+	}
+	if *input != "" {
+		return tuneInput(command, *input, *output, *stats, *program, stdin, stdout)
 	}
 
 	properties, err := channelProperties(channelRequest{
@@ -140,7 +145,9 @@ func runTune(arguments []string, stdout, stderr io.Writer) error {
 		} else {
 			statsCtx, stopStats := context.WithCancel(ctx)
 			defer stopStats()
-			go watchStats(statsCtx, client, chosen, command.stderr)
+			go watchStats(statsCtx, func(ctx context.Context) (host.Tuner, error) {
+				return client.Tuner(ctx, chosen)
+			}, command.stderr)
 		}
 	}
 	if _, err := io.Copy(writer, stream); err != nil && ctx.Err() == nil {

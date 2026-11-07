@@ -25,7 +25,9 @@ const statsInterval = time.Second
 //
 // One line per reading rather than one rewritten in place, because the usual
 // reader of the stream is a player writing to the same terminal.
-func watchStats(ctx context.Context, client *host.Client, id string, w io.Writer) {
+//
+// read は 1 回分の状態を返す。デーモンのチューナーでも、--input で数えた入力でも同じ行になる
+func watchStats(ctx context.Context, read func(context.Context) (host.Tuner, error), w io.Writer) {
 	ticker := time.NewTicker(statsInterval)
 	defer ticker.Stop()
 	var previous *host.Tuner
@@ -35,14 +37,19 @@ func watchStats(ctx context.Context, client *host.Client, id string, w io.Writer
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			current, err := client.Tuner(ctx, id)
+			current, err := read(ctx)
 			if err != nil {
 				if ctx.Err() == nil {
 					fmt.Fprintf(w, "%s stats: %v\n", now.Format("15:04:05"), err)
 				}
 				continue
 			}
-			fmt.Fprintf(w, "%s %s\n", now.Format("15:04:05"), formatStats(previous, current, now.Sub(last)))
+			line := formatStats(previous, current, now.Sub(last))
+			if line == "" {
+				// 伝えることがまだ無い（--input で何も届いていない）ときは行を出さない
+				continue
+			}
+			fmt.Fprintf(w, "%s %s\n", now.Format("15:04:05"), line)
 			previous, last = &current, now
 		}
 	}

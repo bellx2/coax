@@ -2,6 +2,12 @@
 
 bellx2/coax（視聴アプリ向けの fork）の変更履歴。upstream（Till0196/coax）の変更は upstream のリリースを参照。
 
+## 未リリース
+
+### 追加
+
+- `coax tune --input <file|->`: 選局せず、受信済みのストリームをファイルか標準入力から読んで書き出す。coax が対応していないチューナー（PIX-DT295 を pix-ts で受信するなど）の出力にも `--program` と `--stats` を使えるようにするため。`--stats` は入力を数え、ロックや CNR は出さない。
+
 ## 0.1.5-coax.1
 
 upstream v0.1.5 に以下を加えたもの。
