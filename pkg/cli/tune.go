@@ -46,6 +46,8 @@ func runTune(arguments []string, stdin io.Reader, stdout, stderr io.Writer) erro
 		"write the signal and what the daemon sees in the stream to stderr once a second: lock, CNR, bitrate, errors and drops")
 	program := flags.Bool("program", false,
 		"write the programme on now and next to stderr whenever either changes, as the stream's event information table gives them")
+	schedule := flags.Bool("schedule", false,
+		"write each section of the stream's schedule (the event information table's days ahead) to stderr as one line of JSON, once for each version")
 	input := flags.String("input", "",
 		"read a stream already received from this file, or - for stdin, instead of tuning; --program and --stats then read it, and nothing reaches the daemon")
 	alias(flags, "o", "output")
@@ -55,7 +57,7 @@ func runTune(arguments []string, stdin io.Reader, stdout, stderr io.Writer) erro
 		return err
 	}
 	if *input != "" {
-		return tuneInput(command, *input, *output, *stats, *program, stdin, stdout)
+		return tuneInput(command, *input, *output, *stats, *program, *schedule, stdin, stdout)
 	}
 
 	properties, err := channelProperties(channelRequest{
@@ -118,8 +120,8 @@ func runTune(arguments []string, stdin io.Reader, stdout, stderr io.Writer) erro
 	defer closeWriter()
 
 	// 番組情報は書き出すストリームから読む。TSMF の分離はこの後ろで包むので、分離したストリームの番組になる
-	if *program {
-		writer = io.MultiWriter(writer, newProgramWatcher(command.stderr))
+	if *program || *schedule {
+		writer = io.MultiWriter(writer, newProgramWatcher(command.stderr, *program, *schedule))
 	}
 
 	// A satellite demodulator is told the identifier and hands back that stream
