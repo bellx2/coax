@@ -6,6 +6,7 @@ package cli
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,12 @@ func eventSection(service uint16, number byte, eventID uint16, start time.Time, 
 
 // detailedEventSection は説明の文（text）と、拡張形式イベント記述子の中身（extended、1 つが 1 記述子）も載せる
 func detailedEventSection(service uint16, number byte, eventID uint16, start time.Time, duration time.Duration,
+	title, text []byte, extended [][]byte) []byte {
+	return tableSection(isdb.TableIDEITActual, 1, service, number, eventID, start, duration, title, text, extended)
+}
+
+// tableSection は表（table）と版（version）も指定する。スケジュールの表（0x50 から）にも使う
+func tableSection(table, version byte, service uint16, number byte, eventID uint16, start time.Time, duration time.Duration,
 	title, text []byte, extended [][]byte) []byte {
 	epoch := time.Date(1858, time.November, 17, 0, 0, 0, 0, time.UTC)
 	day := uint16(start.Sub(epoch).Hours() / 24)
@@ -41,11 +48,11 @@ func detailedEventSection(service uint16, number byte, eventID uint16, start tim
 	event = append(event, 0x80|byte(len(descriptors)>>8), byte(len(descriptors)))
 	event = append(event, descriptors...)
 
-	body := []byte{byte(service >> 8), byte(service), 0xc1, number, 1}
-	body = append(body, 0x7f, 0xe0, 0x7f, 0xe0, 1, isdb.TableIDEITActual) // TSID、ONID、最後のセクションと表
+	body := []byte{byte(service >> 8), byte(service), 0xc1 | version<<1, number, 1}
+	body = append(body, 0x7f, 0xe0, 0x7f, 0xe0, 1, table) // TSID、ONID、最後のセクションと表
 	body = append(body, event...)
 	length := len(body) + 4
-	section := []byte{isdb.TableIDEITActual, 0xf0 | byte(length>>8), byte(length)}
+	section := []byte{table, 0xf0 | byte(length>>8), byte(length)}
 	section = append(section, body...)
 	return binary.BigEndian.AppendUint32(section, mpegts.CRC32(section))
 }
@@ -83,7 +90,7 @@ func TestProgramWatcherReportsNowAndNext(t *testing.T) {
 	stream = append(stream, nullPacket()...)
 
 	var out bytes.Buffer
-	watcher := newProgramWatcher(&out)
+	watcher := newProgramWatcher(&out, true, false)
 	// 読み出しの区切りはパケットの区切りと一致しない
 	for len(stream) > 0 {
 		n := min(100, len(stream))
@@ -131,7 +138,7 @@ func TestProgramWatcherReportsDetails(t *testing.T) {
 		extendedBody(1, 1, nil, rest),
 	})
 	var out bytes.Buffer
-	watcher := newProgramWatcher(&out)
+	watcher := newProgramWatcher(&out, true, false)
 	watcher.Write(append(packets(section), nullPacket()...))
 
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
@@ -150,5 +157,59 @@ func TestProgramWatcherReportsDetails(t *testing.T) {
 	}
 	if !strings.Contains(lines[1], `\n`) {
 		t.Errorf("text line %q should carry the line break as \\n", lines[1])
+	}
+}
+
+func TestProgramWatcherReportsSchedule(t *testing.T) {
+	day := time.Date(2026, 11, 8, 0, 0, 0, 0, time.UTC)
+	title := []byte("NEWS")
+	now := tableSection(isdb.TableIDEITActual, 1, 1408, 0, 1, day.Add(21*time.Hour), time.Hour, title, nil, nil)
+	scheduled := func(version byte) []byte {
+		return tableSection(isdb.TableIDEITScheduleLow, version, 1408, 8, 7, day.Add(23*time.Hour), 30*time.Minute, title, nil, nil)
+	}
+
+	var out bytes.Buffer
+	watcher := newProgramWatcher(&out, false, true)
+	watcher.Write(append(append(packets(now), packets(scheduled(1))...), nullPacket()...))
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	// --program を付けなければ今の番組は書かない
+	if len(lines) != 1 {
+		t.Fatalf("got %q, want one schedule line", lines)
+	}
+	_, encoded, ok := strings.Cut(lines[0], " schedule ")
+	if !ok {
+		t.Fatalf("line %q is not a schedule line", lines[0])
+	}
+	var got scheduleLine
+	if err := json.Unmarshal([]byte(encoded), &got); err != nil {
+		t.Fatalf("unmarshal %q: %v", encoded, err)
+	}
+	if got.Service != 1408 || got.Network != 0x7fe0 || got.Table != isdb.TableIDEITScheduleLow || got.Section != 8 ||
+		got.Version != 1 || len(got.Events) != 1 {
+		t.Fatalf("got %+v", got)
+	}
+	event := got.Events[0]
+	if event.ID != 7 || event.Start != "2026-11-08T23:00:00" || event.Duration == nil || *event.Duration != 1800 ||
+		event.Title != isdb.DescriptorText(title) {
+		t.Errorf("got event %+v", event)
+	}
+
+	// 同じ版は書かず、版が変われば書く
+	out.Reset()
+	watcher.Write(append(packets(scheduled(1)), nullPacket()...))
+	if out.Len() != 0 {
+		t.Errorf("wrote %q for a section already written", out.String())
+	}
+	watcher.Write(append(packets(scheduled(2)), nullPacket()...))
+	if !strings.Contains(out.String(), `"version":2`) {
+		t.Errorf("got %q, want the new version written", out.String())
+	}
+
+	// --program だけならスケジュールは書かない
+	out.Reset()
+	only := newProgramWatcher(&out, true, false)
+	only.Write(append(packets(scheduled(1)), nullPacket()...))
+	if out.Len() != 0 {
+		t.Errorf("wrote %q without --schedule", out.String())
 	}
 }

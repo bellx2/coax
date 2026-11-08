@@ -22,12 +22,12 @@ import (
 // inputFlags は --input と一緒に使えるフラグ。ほかは選局とデーモンのためのもので、受信済みのストリームを読むときには効かない
 var inputFlags = map[string]bool{
 	"input": true, "output": true, "o": true,
-	"stats": true, "program": true, "verbose": true,
+	"stats": true, "program": true, "schedule": true, "verbose": true,
 }
 
 // tuneInput は coax が対応していないチューナーの出力など、受信済みのストリームを読んで書き出す。
-// --program と --stats は選局したときと同じ行を stderr に出す
-func tuneInput(command *command, path, output string, stats, program bool, stdin io.Reader, stdout io.Writer) error {
+// --program、--schedule と --stats は選局したときと同じ行を stderr に出す
+func tuneInput(command *command, path, output string, stats, program, schedule bool, stdin io.Reader, stdout io.Writer) error {
 	var refused []string
 	command.flags.Visit(func(f *flag.Flag) {
 		if !inputFlags[f.Name] {
@@ -53,8 +53,8 @@ func tuneInput(command *command, path, output string, stats, program bool, stdin
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	if program {
-		writer = io.MultiWriter(writer, newProgramWatcher(command.stderr))
+	if program || schedule {
+		writer = io.MultiWriter(writer, newProgramWatcher(command.stderr, program, schedule))
 	}
 	if stats {
 		counter := newInputCounter()

@@ -4,6 +4,7 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"slices"
@@ -17,15 +18,26 @@ import (
 // 番組情報（EIT）が流れる PID。0x12 はフルセグ用（H-EIT）、0x26 と 0x27 はワンセグ用（M-EIT、L-EIT）
 var eventPIDs = []uint16{0x12, 0x26, 0x27}
 
-// programWatcher は書き出すストリームを横で読み、今の番組と次の番組が変わるたびに 1 行ずつ報告する。
+// programWatcher は書き出すストリームを横で読み、今の番組と次の番組が変わるたびに 1 行ずつ報告する（--program）。
+// schedule なら、番組表（EIT のスケジュール）のセクションも 1 つ 1 行で報告する（--schedule）。
 // 書き込みは必ず成功させる。ストリームの書き出しを止めないため。
 type programWatcher struct {
 	w          io.Writer
 	pending    []byte
 	collectors map[uint16]*mpegts.SectionCollector
+	nowNext    bool
+	schedule   bool
 	// サービスごとの今の番組（[0]）と次の番組（[1]）
 	events map[uint16]*[2]programEvent
 	shown  [2]programEvent
+	// 書いたスケジュールのセクションの版。同じ版は繰り返し届くので一度だけ書く
+	scheduled map[scheduleSection]byte
+}
+
+// scheduleSection はスケジュールのセクションを見分けるもの
+type scheduleSection struct {
+	network, transport, service uint16
+	table, number               byte
 }
 
 type programEvent struct {
@@ -46,11 +58,14 @@ func (event programEvent) equal(other programEvent) bool {
 		event.title == other.title && event.text == other.text && slices.Equal(event.items, other.items)
 }
 
-func newProgramWatcher(w io.Writer) *programWatcher {
+func newProgramWatcher(w io.Writer, nowNext, schedule bool) *programWatcher {
 	watcher := &programWatcher{
 		w:          w,
 		collectors: map[uint16]*mpegts.SectionCollector{},
+		nowNext:    nowNext,
+		schedule:   schedule,
 		events:     map[uint16]*[2]programEvent{},
+		scheduled:  map[scheduleSection]byte{},
 	}
 	for _, pid := range eventPIDs {
 		watcher.collectors[pid] = &mpegts.SectionCollector{}
@@ -97,8 +112,17 @@ func (watcher *programWatcher) packet(packet []byte) {
 
 func (watcher *programWatcher) section(section []byte) {
 	table := isdb.ParseEventTable(section)
+	if table == nil {
+		return
+	}
+	if table.Schedule() {
+		if watcher.schedule {
+			watcher.reportSchedule(table)
+		}
+		return
+	}
 	// 自分のストリームの、今と次の番組の表だけを見る。セクション 0 が今、1 が次
-	if table == nil || table.TableID != isdb.TableIDEITActual || table.SectionNumber > 1 {
+	if !watcher.nowNext || table.TableID != isdb.TableIDEITActual || table.SectionNumber > 1 {
 		return
 	}
 	pair := watcher.events[table.ServiceID]
@@ -187,4 +211,63 @@ func (event programEvent) span() string {
 		return event.start.Format("15:04") + "-"
 	}
 	return event.start.Format("15:04") + "-" + event.start.Add(event.duration).Format("15:04")
+}
+
+// scheduleLine は --schedule の 1 行の JSON。1 行が EIT のスケジュールの 1 セクション
+type scheduleLine struct {
+	Network   uint16          `json:"network"`
+	Transport uint16          `json:"transport"`
+	Service   uint16          `json:"service"`
+	Table     byte            `json:"table"`
+	Section   byte            `json:"section"`
+	Version   byte            `json:"version"`
+	Events    []scheduleEvent `json:"events"`
+}
+
+type scheduleEvent struct {
+	ID uint16 `json:"id"`
+	// 放送の時刻（日本時間）。分からなければ省く
+	Start    string                   `json:"start,omitempty"`
+	Duration *int64                   `json:"duration,omitempty"`
+	Title    string                   `json:"title,omitempty"`
+	Text     string                   `json:"text,omitempty"`
+	Items    []isdb.ExtendedEventItem `json:"items,omitempty"`
+}
+
+// reportSchedule はスケジュールのセクションを、版が変わったときだけ 1 行の JSON で書く。
+// 番組の無いセクションも書く。その区間の番組が無くなったことを伝えるため
+func (watcher *programWatcher) reportSchedule(table *isdb.EventTable) {
+	key := scheduleSection{
+		network: table.OriginalNetworkID, transport: table.TransportStreamID, service: table.ServiceID,
+		table: table.TableID, number: table.SectionNumber,
+	}
+	if version, ok := watcher.scheduled[key]; ok && version == table.Version {
+		return
+	}
+	watcher.scheduled[key] = table.Version
+	line := scheduleLine{
+		Network: key.network, Transport: key.transport, Service: key.service,
+		Table: key.table, Section: key.number, Version: table.Version,
+		Events: []scheduleEvent{},
+	}
+	for _, event := range table.Events {
+		one := eventOf(event)
+		out := scheduleEvent{ID: one.id, Title: one.title, Text: one.text, Items: one.items}
+		if one.startKnown {
+			out.Start = one.start.Format("2006-01-02T15:04:05")
+		}
+		if one.durationKnown {
+			seconds := int64(one.duration / time.Second)
+			out.Duration = &seconds
+		}
+		line.Events = append(line.Events, out)
+	}
+	// 番組名の「&」などをそのまま書く。Encode は最後に改行を足す
+	var encoded strings.Builder
+	encoder := json.NewEncoder(&encoded)
+	encoder.SetEscapeHTML(false)
+	if encoder.Encode(line) != nil {
+		return
+	}
+	fmt.Fprintf(watcher.w, "%s schedule %s", time.Now().Format("15:04:05"), encoded.String())
 }

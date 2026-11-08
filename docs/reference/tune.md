@@ -128,10 +128,37 @@ $ ./coax tune --ch 27 --program -o /dev/null
 - `--stream-id`でTSMFから分離するときは、分離したストリームの番組を出します
 - `--stats`と一緒に使えます。行の2番目の語（`now`、`next`か、`locked`などの受信状態）で区別できます
 
+### 番組表を読む（`--schedule`）
+
+`--schedule`を付けると、受信しているストリームの番組表（EITのスケジュール、テーブルID `0x50`〜`0x6F`）を標準エラーへ書きます。
+1行が1セクションで、「時刻 `schedule` JSON」です。同じセクションは版（`version`）が変わったときだけ書きます。
+
+```console
+$ ./coax tune --ch 27 --schedule -o /dev/null
+23:02:11 schedule {"network":32736,"transport":32736,"service":1024,"table":80,"section":8,"version":3,"events":[{"id":1234,"start":"2026-11-08T23:00:00","duration":1800,"title":"ニュース","text":"…","items":[{"heading":"出演者","value":"…"}]}]}
+```
+
+| キー | 意味 |
+| --- | --- |
+| `network`、`transport`、`service` | original_network_id、transport_stream_id、service_id |
+| `table`、`section`、`version` | テーブルID、セクション番号、版。この3つとサービスで、どのセクションの何版かが決まる |
+| `events` | セクションに載った番組。番組の無いセクションは空の配列で書く（その区間に番組が無いことを示す） |
+| `events[].id` | event_id |
+| `events[].start` | 開始。放送の時刻（日本時間）で、時差は付けない。分からなければ省く |
+| `events[].duration` | 長さ（秒）。分からなければ省く |
+| `events[].title`、`events[].text` | 番組名と番組の説明（短形式イベント記述子） |
+| `events[].items` | 詳しい説明（拡張形式イベント記述子）の項目。見出し（`heading`）と内容（`value`） |
+
+- 地上波のストリームに入っているのは、その物理チャンネルのサービスの番組表だけです。衛星は1つのストリームで全局分を送ります
+- 番組表は少しずつ繰り返し送られるので、全部がそろうまで時間がかかります（27chで8日分がそろうまで約60秒）
+- テーブルID `0x50`〜`0x57`は基本情報（番組名と説明）、`0x58`〜`0x5F`は拡張情報（詳しい説明）です。拡張情報の番組には`title`と`text`が無く`items`だけが入るので、読み手は`id`で基本情報とまとめます
+- 読み手は、セクション（サービス、`table`、`section`）ごとに新しい版で置き換えると、番組の変更や取り消しも反映できます
+- `--program`、`--stats`と一緒に使えます。行の2番目の語（`schedule`）で区別できます
+
 ### 受信済みのストリームを読む（`--input`）
 
 `--input`を付けると、選局せず、ファイルか標準入力（`-`）から受信済みのストリームを読んで書き出します。
-coaxが対応していないチューナーの出力に、`--program`と`--stats`を使うためのものです。
+coaxが対応していないチューナーの出力に、`--program`、`--schedule`と`--stats`を使うためのものです。
 `coaxd`には接続しません。
 
 ```console
@@ -142,7 +169,7 @@ $ pix-ts --runtime-dir "$runtime_dir" --instance tuner --receiver 0 -c T27 -t - 
 - `--stats`は、`coaxd`から読む代わりに入力を数えます。ロック、CNR、入力レベル、`dropped`は分からないので表示しません
 - 入力が届くまでは、`--stats`の行を書きません
 - 入力が終わると終了します。`Ctrl-C`かSIGTERMでも終了します
-- 一緒に使えるのは`--output`、`--stats`、`--program`、`--verbose`だけです。選局やデーモンのためのオプション（`--ch`、`--tuner`など）を付けるとエラーになります
+- 一緒に使えるのは`--output`、`--stats`、`--program`、`--schedule`、`--verbose`だけです。選局やデーモンのためのオプション（`--ch`、`--tuner`など）を付けるとエラーになります
 
 チャンネル定義ファイルに書ける項目は、どれでも`-P NAME=VALUE`で渡せます（`-P MODULATION=QAM/64`など）。
 書式は[channel-files.md](channel-files.md)と同じです。

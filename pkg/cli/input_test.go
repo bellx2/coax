@@ -31,6 +31,21 @@ func TestTuneInputCopiesStdin(t *testing.T) {
 	}
 }
 
+// TestTuneInputReportsSchedule は --input でも --schedule の行を出すことを確かめる
+func TestTuneInputReportsSchedule(t *testing.T) {
+	start := time.Date(2026, 11, 8, 23, 0, 0, 0, time.UTC)
+	section := tableSection(0x50, 1, 1024, 0, 1, start, time.Hour, []byte("Next"), nil, nil)
+	stream := append(packets(section), nullPacket()...)
+
+	var stdout, stderr bytes.Buffer
+	if err := runTune([]string{"--input", "-", "--schedule"}, bytes.NewReader(stream), &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stderr.String(), " schedule {") {
+		t.Fatalf("--schedule の行が無い: %q", stderr.String())
+	}
+}
+
 // TestTuneInputReadsAFile はファイルを読んでファイルへ書き出す
 func TestTuneInputReadsAFile(t *testing.T) {
 	dir := t.TempDir()
